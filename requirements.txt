@@ -1,1 +1,1 @@
-# No external packages are required for Phase 1.
+# No external packages are required for the Task Scheduler MVP.

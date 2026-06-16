@@ -12,6 +12,7 @@ CATALOG_FILE = BASE_DIR / "app_catalog.json"
 LOG_FILE = BASE_DIR / "logs" / "agent.log"
 POLL_SECONDS = 5
 ALLOWED_ACTIONS = {"install"}
+LOGGER = logging.getLogger("systemo_agent")
 
 
 def utc_now():
@@ -20,11 +21,25 @@ def utc_now():
 
 def setup_logging():
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        filename=LOG_FILE,
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+
+    if not any(
+        isinstance(handler, logging.FileHandler)
+        and Path(handler.baseFilename) == LOG_FILE
+        for handler in LOGGER.handlers
+    ):
+        file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        )
+        LOGGER.addHandler(file_handler)
+
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+
+
+def write_log(message):
+    setup_logging()
+    LOGGER.info(message)
 
 
 def load_json(path, default):
@@ -35,7 +50,10 @@ def load_json(path, default):
         return json.load(file)
 
 
-def save_jobs(jobs):
+def save_jobs(jobs=None):
+    if jobs is None:
+        jobs = load_jobs()
+
     temp_file = JOBS_FILE.with_suffix(".json.tmp")
     with temp_file.open("w", encoding="utf-8") as file:
         json.dump(jobs, file, indent=2)
@@ -72,6 +90,9 @@ def get_catalog_command(catalog, app, action):
 
     command = actions.get(action)
     if not isinstance(command, list) or not all(isinstance(arg, str) for arg in command):
+        return None
+
+    if not command or Path(command[0]).name.lower() not in {"winget", "winget.exe"}:
         return None
 
     return command
@@ -114,8 +135,35 @@ def run_install(command):
         raise RuntimeError(output or f"Command failed with exit code {completed.returncode}")
 
 
-def process_job(job, jobs, catalog):
+def process_job(job):
+    catalog = load_catalog()
+    jobs = load_jobs()
+
+    target_job = job
+    job_id = job.get("id") if isinstance(job, dict) else None
+    if job_id:
+        for existing_job in jobs:
+            if isinstance(existing_job, dict) and existing_job.get("id") == job_id:
+                target_job = existing_job
+                break
+        else:
+            jobs.append(target_job)
+    else:
+        jobs = [target_job]
+
+    _process_job(target_job, jobs, catalog)
+
+
+def _process_job(job, jobs, catalog):
+    if not isinstance(job, dict):
+        write_log("Invalid job skipped: job must be a JSON object")
+        return
+
     job_id = get_job_label(job)
+    if job.get("status") != "pending":
+        LOGGER.info("Job %s skipped: status is not pending", job_id)
+        return
+
     app = job.get("app")
     action = job.get("action")
 
@@ -126,7 +174,7 @@ def process_job(job, jobs, catalog):
         job["finished_at"] = utc_now()
         job["last_error"] = validation_error
         save_jobs(jobs)
-        logging.warning("Job %s failed validation: %s", job_id, validation_error)
+        LOGGER.warning("Job %s failed validation: %s", job_id, validation_error)
         return
 
     command = get_catalog_command(catalog, app, action)
@@ -135,17 +183,17 @@ def process_job(job, jobs, catalog):
     job["finished_at"] = None
     job["last_error"] = None
     save_jobs(jobs)
-    logging.info("Job %s started: %s %s", job_id, action, app)
+    LOGGER.info("Job %s started: %s %s", job_id, action, app)
 
     try:
         run_install(command)
         job["status"] = "success"
         job["last_error"] = None
-        logging.info("Job %s succeeded", job_id)
+        LOGGER.info("Job %s succeeded", job_id)
     except Exception as error:
         job["status"] = "failed"
         job["last_error"] = str(error)
-        logging.exception("Job %s failed", job_id)
+        LOGGER.exception("Job %s failed", job_id)
     finally:
         job["finished_at"] = utc_now()
         save_jobs(jobs)
@@ -157,20 +205,29 @@ def process_pending_jobs():
 
     for job in jobs:
         if isinstance(job, dict) and job.get("status") == "pending":
-            process_job(job, jobs, catalog)
+            _process_job(job, jobs, catalog)
 
 
-def main():
+def run_agent_loop(stop_event=None):
     setup_logging()
-    logging.info("Systemo Agent started")
+    write_log("Systemo Agent started")
 
-    while True:
+    while stop_event is None or not stop_event.is_set():
         try:
             process_pending_jobs()
         except Exception:
-            logging.exception("Agent loop failed")
+            LOGGER.exception("Agent loop failed")
 
-        time.sleep(POLL_SECONDS)
+        if stop_event is None:
+            time.sleep(POLL_SECONDS)
+        else:
+            stop_event.wait(POLL_SECONDS)
+
+    write_log("Systemo Agent stopped")
+
+
+def main():
+    run_agent_loop()
 
 
 if __name__ == "__main__":
