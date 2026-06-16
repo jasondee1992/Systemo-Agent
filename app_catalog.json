@@ -1,0 +1,30 @@
+{
+  "vlc": {
+    "name": "VLC media player",
+    "actions": {
+      "install": [
+        "winget",
+        "install",
+        "--id",
+        "VideoLAN.VLC",
+        "--silent",
+        "--accept-package-agreements",
+        "--accept-source-agreements"
+      ]
+    }
+  },
+  "chrome": {
+    "name": "Google Chrome",
+    "actions": {
+      "install": [
+        "winget",
+        "install",
+        "--id",
+        "Google.Chrome",
+        "--silent",
+        "--accept-package-agreements",
+        "--accept-source-agreements"
+      ]
+    }
+  }
+}
