@@ -1,0 +1,15 @@
+[
+  {
+    "id": "job-20260617035440-ae88e4e6",
+    "device_id": "any",
+    "app": "vlc",
+    "action": "install",
+    "status": "skipped",
+    "created_at": "2026-06-17T03:54:40.451870+00:00",
+    "started_at": "2026-06-17T03:58:15.228239+00:00",
+    "finished_at": "2026-06-17T03:58:21.028161+00:00",
+    "last_error": null,
+    "message": "Application is already installed",
+    "attempts": 1
+  }
+]

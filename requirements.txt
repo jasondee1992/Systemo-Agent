@@ -1,1 +1,3 @@
-# No external packages are required for the Task Scheduler MVP.
+fastapi
+uvicorn
+requests

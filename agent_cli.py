@@ -5,7 +5,14 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from agent import AGENT_STATE_FILE, load_or_create_agent_config
+from agent import (
+    AGENT_STATE_FILE,
+    CONFIG_FILE,
+    DEFAULT_API_BASE_URL,
+    DEFAULT_JOB_SOURCE,
+    load_or_create_agent_config,
+    save_json,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -59,6 +66,16 @@ def load_jobs():
     return jobs
 
 
+def get_requests_module():
+    import requests
+
+    return requests
+
+
+def get_api_base_url(config):
+    return str(config.get("api_base_url") or DEFAULT_API_BASE_URL).rstrip("/")
+
+
 def add_job(app):
     catalog = load_catalog()
     if app not in catalog:
@@ -77,6 +94,52 @@ def add_job(app):
     jobs.append(job)
     save_jobs(jobs)
     print(f"Added job {job['id']} for {app} install")
+
+
+def print_mode():
+    config = load_or_create_agent_config()
+    print(f"job_source: {config.get('job_source') or DEFAULT_JOB_SOURCE}")
+    print(f"api_base_url: {config.get('api_base_url') or DEFAULT_API_BASE_URL}")
+
+
+def set_mode(mode):
+    if mode not in {"local", "api"}:
+        raise ValueError("Mode must be 'local' or 'api'")
+
+    config = load_or_create_agent_config()
+    config["job_source"] = mode
+    config["api_base_url"] = config.get("api_base_url") or DEFAULT_API_BASE_URL
+    save_json(CONFIG_FILE, config)
+    print(f"Job source set to {mode}.")
+
+
+def api_add_job(app):
+    catalog = load_catalog()
+    if app not in catalog:
+        approved_apps = ", ".join(sorted(catalog.keys())) or "<none>"
+        raise ValueError(f"Unsupported app '{app}'. Approved apps: {approved_apps}")
+
+    config = load_or_create_agent_config()
+    requests = get_requests_module()
+    response = requests.post(
+        f"{get_api_base_url(config)}/api/agent/jobs",
+        json={"device_id": "any", "app": app, "action": ALLOWED_ACTION},
+        timeout=10,
+    )
+    response.raise_for_status()
+    job = response.json()
+    print(f"Created API job {job.get('id')} for {app} install")
+
+
+def api_list_jobs():
+    config = load_or_create_agent_config()
+    requests = get_requests_module()
+    response = requests.get(f"{get_api_base_url(config)}/api/agent/jobs/all", timeout=10)
+    response.raise_for_status()
+    jobs = response.json()
+    if not isinstance(jobs, list):
+        raise ValueError("API jobs response must be a JSON array")
+    print_jobs(list(reversed(jobs)))
 
 
 def get_job_value(job, field):
@@ -274,6 +337,16 @@ def build_parser():
     add_job_parser = subparsers.add_parser("add-job", help="Append an approved install job")
     add_job_parser.add_argument("app")
 
+    subparsers.add_parser("mode", help="Print current job source mode")
+
+    set_mode_parser = subparsers.add_parser("set-mode", help="Set job source mode")
+    set_mode_parser.add_argument("mode", choices=["local", "api"])
+
+    api_add_job_parser = subparsers.add_parser("api-add-job", help="Create an approved mock API job")
+    api_add_job_parser.add_argument("app")
+
+    subparsers.add_parser("api-list-jobs", help="List mock API jobs")
+
     subparsers.add_parser("status", help="Print current jobs")
     subparsers.add_parser("logs", help="Print the last 50 agent log lines")
     subparsers.add_parser("info", help="Print local agent identity and config")
@@ -298,6 +371,14 @@ def main():
     try:
         if args.command == "add-job":
             add_job(args.app)
+        elif args.command == "mode":
+            print_mode()
+        elif args.command == "set-mode":
+            set_mode(args.mode)
+        elif args.command == "api-add-job":
+            api_add_job(args.app)
+        elif args.command == "api-list-jobs":
+            api_list_jobs()
         elif args.command == "status":
             print_status()
         elif args.command == "logs":

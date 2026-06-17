@@ -118,6 +118,12 @@ Check local heartbeat health:
 python .\agent_cli.py health
 ```
 
+Show current job source mode:
+
+```powershell
+python .\agent_cli.py mode
+```
+
 To test installed-app detection:
 
 1. Add a VLC job and let the agent install VLC.
@@ -134,6 +140,55 @@ python .\agent_cli.py status
 ```
 
 The second VLC job should become `skipped` with the message `Application is already installed`.
+
+## Phase 6 Mock API Mode
+
+Local `jobs.json` mode remains the default. Phase 6 adds an optional mock backend API mode for testing backend polling.
+
+Run the mock server in a separate terminal:
+
+```powershell
+python mock_server.py
+```
+
+Set the agent to API mode:
+
+```powershell
+python .\agent_cli.py set-mode api
+```
+
+Restart the Systemo Agent scheduled task:
+
+```powershell
+Stop-ScheduledTask -TaskName "Systemo Agent"
+Start-ScheduledTask -TaskName "Systemo Agent"
+```
+
+Add a test VLC job to the mock API:
+
+```powershell
+python .\agent_cli.py api-add-job vlc
+```
+
+List API jobs:
+
+```powershell
+python .\agent_cli.py api-list-jobs
+```
+
+Check agent health:
+
+```powershell
+python .\agent_cli.py health
+```
+
+Return to local mode:
+
+```powershell
+python .\agent_cli.py set-mode local
+```
+
+In API mode, the agent polls `GET /api/agent/jobs?device_id=<device_id>`, processes only jobs with `status` set to `approved`, and reports final results to `POST /api/agent/jobs/{job_id}/result`. API jobs are not copied into local `jobs.json`.
 
 Job management examples:
 

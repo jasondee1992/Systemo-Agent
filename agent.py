@@ -24,6 +24,8 @@ POLL_SECONDS = 5
 ALLOWED_ACTIONS = {"install"}
 AGENT_NAME = "Systemo Agent"
 AGENT_VERSION = "0.3.0"
+DEFAULT_JOB_SOURCE = "local"
+DEFAULT_API_BASE_URL = "http://127.0.0.1:8008"
 LOGGER = logging.getLogger("systemo_agent")
 
 
@@ -115,6 +117,8 @@ def load_or_create_agent_config():
             "username": get_username(),
             "agent_name": AGENT_NAME,
             "agent_version": AGENT_VERSION,
+            "job_source": config.get("job_source") or DEFAULT_JOB_SOURCE,
+            "api_base_url": config.get("api_base_url") or DEFAULT_API_BASE_URL,
         }
     )
 
@@ -308,6 +312,82 @@ def run_install(command):
         raise RuntimeError(output or f"Command failed with exit code {completed.returncode}")
 
 
+def save_local_job_state(jobs):
+    def save():
+        save_jobs(jobs)
+
+    return save
+
+
+def process_job_record(job, catalog, expected_status, save_state=None):
+    if not isinstance(job, dict):
+        write_log("Invalid job skipped: job must be a JSON object")
+        return None
+
+    job_id = get_job_label(job)
+    if job.get("status") != expected_status:
+        LOGGER.info("Job %s skipped: status is not %s", job_id, expected_status)
+        return job
+
+    def persist():
+        if save_state is not None:
+            save_state()
+
+    app = job.get("app")
+    action = job.get("action")
+    job["attempts"] = get_next_attempt_count(job)
+    job["started_at"] = utc_now()
+    job["finished_at"] = None
+    job["last_error"] = None
+    job["message"] = "Processing job"
+    persist()
+
+    validation_error = validate_job(job, catalog)
+    if validation_error:
+        job["status"] = "failed"
+        job["finished_at"] = utc_now()
+        job["last_error"] = validation_error
+        job["message"] = validation_error
+        persist()
+        LOGGER.warning("Job %s failed validation: %s", job_id, validation_error)
+        return job
+
+    command = get_catalog_command(catalog, app, action)
+
+    if is_app_installed(app):
+        job["status"] = "skipped"
+        job["message"] = "Application is already installed"
+        job["last_error"] = None
+        job["finished_at"] = utc_now()
+        persist()
+        LOGGER.info("Job %s skipped: %s is already installed", job_id, app)
+        return job
+
+    job["status"] = "installing"
+    job["finished_at"] = None
+    job["last_error"] = None
+    job["message"] = "Installing application"
+    persist()
+    LOGGER.info("Job %s started: %s %s", job_id, action, app)
+
+    try:
+        run_install(command)
+        job["status"] = "success"
+        job["last_error"] = None
+        job["message"] = "Application installed successfully"
+        LOGGER.info("Job %s succeeded", job_id)
+    except Exception as error:
+        job["status"] = "failed"
+        job["last_error"] = str(error)
+        job["message"] = "Application installation failed"
+        LOGGER.exception("Job %s failed", job_id)
+    finally:
+        job["finished_at"] = utc_now()
+        persist()
+
+    return job
+
+
 def process_job(job):
     catalog = load_catalog()
     jobs = load_jobs()
@@ -328,66 +408,7 @@ def process_job(job):
 
 
 def _process_job(job, jobs, catalog):
-    if not isinstance(job, dict):
-        write_log("Invalid job skipped: job must be a JSON object")
-        return
-
-    job_id = get_job_label(job)
-    if job.get("status") != "pending":
-        LOGGER.info("Job %s skipped: status is not pending", job_id)
-        return
-
-    app = job.get("app")
-    action = job.get("action")
-    job["attempts"] = get_next_attempt_count(job)
-    job["started_at"] = utc_now()
-    job["finished_at"] = None
-    job["last_error"] = None
-    job["message"] = "Processing job"
-    save_jobs(jobs)
-
-    validation_error = validate_job(job, catalog)
-    if validation_error:
-        job["status"] = "failed"
-        job["finished_at"] = utc_now()
-        job["last_error"] = validation_error
-        job["message"] = validation_error
-        save_jobs(jobs)
-        LOGGER.warning("Job %s failed validation: %s", job_id, validation_error)
-        return
-
-    command = get_catalog_command(catalog, app, action)
-
-    if is_app_installed(app):
-        job["status"] = "skipped"
-        job["message"] = "Application is already installed"
-        job["last_error"] = None
-        job["finished_at"] = utc_now()
-        save_jobs(jobs)
-        LOGGER.info("Job %s skipped: %s is already installed", job_id, app)
-        return
-
-    job["status"] = "installing"
-    job["finished_at"] = None
-    job["last_error"] = None
-    job["message"] = "Installing application"
-    save_jobs(jobs)
-    LOGGER.info("Job %s started: %s %s", job_id, action, app)
-
-    try:
-        run_install(command)
-        job["status"] = "success"
-        job["last_error"] = None
-        job["message"] = "Application installed successfully"
-        LOGGER.info("Job %s succeeded", job_id)
-    except Exception as error:
-        job["status"] = "failed"
-        job["last_error"] = str(error)
-        job["message"] = "Application installation failed"
-        LOGGER.exception("Job %s failed", job_id)
-    finally:
-        job["finished_at"] = utc_now()
-        save_jobs(jobs)
+    process_job_record(job, catalog, "pending", save_state=save_local_job_state(jobs))
 
 
 def process_pending_jobs():
@@ -397,6 +418,80 @@ def process_pending_jobs():
     for job in jobs:
         if isinstance(job, dict) and job.get("status") == "pending":
             _process_job(job, jobs, catalog)
+
+
+def get_requests_module():
+    import requests
+
+    return requests
+
+
+def get_api_base_url(config):
+    return str(config.get("api_base_url") or DEFAULT_API_BASE_URL).rstrip("/")
+
+
+def fetch_api_jobs(config):
+    requests = get_requests_module()
+    api_base_url = get_api_base_url(config)
+    response = requests.get(
+        f"{api_base_url}/api/agent/jobs",
+        params={"device_id": config.get("device_id")},
+        timeout=10,
+    )
+    response.raise_for_status()
+    jobs = response.json()
+    if not isinstance(jobs, list):
+        raise ValueError("API jobs response must be a JSON array")
+    return jobs
+
+
+def report_api_job_result(config, job):
+    requests = get_requests_module()
+    api_base_url = get_api_base_url(config)
+    job_id = job.get("id")
+    if not job_id:
+        raise ValueError("API job missing id")
+
+    payload = {
+        "status": job.get("status"),
+        "started_at": job.get("started_at"),
+        "finished_at": job.get("finished_at"),
+        "last_error": job.get("last_error"),
+        "message": job.get("message"),
+        "attempts": job.get("attempts"),
+    }
+    response = requests.post(
+        f"{api_base_url}/api/agent/jobs/{job_id}/result",
+        json=payload,
+        timeout=10,
+    )
+    response.raise_for_status()
+
+
+def process_api_jobs(config):
+    catalog = load_catalog()
+    jobs = fetch_api_jobs(config)
+
+    for api_job in jobs:
+        if not isinstance(api_job, dict):
+            LOGGER.warning("Invalid API job skipped: job must be an object")
+            continue
+
+        if api_job.get("status") != "approved":
+            LOGGER.info("API job %s skipped: status is not approved", get_job_label(api_job))
+            continue
+
+        processed_job = process_job_record(api_job, catalog, "approved")
+        if processed_job is not None:
+            report_api_job_result(config, processed_job)
+
+
+def process_configured_job_source(config):
+    job_source = config.get("job_source") or DEFAULT_JOB_SOURCE
+    if job_source == "api":
+        process_api_jobs(config)
+    else:
+        process_pending_jobs()
 
 
 def run_agent_loop(stop_event=None):
@@ -422,7 +517,7 @@ def run_agent_loop(stop_event=None):
         )
 
         try:
-            process_pending_jobs()
+            process_configured_job_source(config)
         except Exception:
             error_traceback = traceback.format_exc()
             LOGGER.exception("Agent loop failed")
