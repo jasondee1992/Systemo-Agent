@@ -1,10 +1,12 @@
 import getpass
 import json
 import logging
+import os
 import platform
 import socket
 import subprocess
 import time
+import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +15,8 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_DIR = BASE_DIR / "config"
 CONFIG_FILE = CONFIG_DIR / "agent_config.json"
+RUNTIME_DIR = BASE_DIR / "runtime"
+AGENT_STATE_FILE = RUNTIME_DIR / "agent_state.json"
 JOBS_FILE = BASE_DIR / "jobs.json"
 CATALOG_FILE = BASE_DIR / "app_catalog.json"
 LOG_FILE = BASE_DIR / "logs" / "agent.log"
@@ -112,6 +116,33 @@ def load_or_create_agent_config():
 
     save_json(CONFIG_FILE, config)
     return config
+
+
+def build_agent_state(config, last_loop_started_at=None, last_loop_finished_at=None, last_error=None):
+    return {
+        "status": "running",
+        "last_heartbeat_at": utc_now(),
+        "device_id": config.get("device_id"),
+        "hostname": config.get("hostname"),
+        "agent_version": config.get("agent_version"),
+        "current_pid": os.getpid(),
+        "last_loop_started_at": last_loop_started_at,
+        "last_loop_finished_at": last_loop_finished_at,
+        "last_error": last_error,
+    }
+
+
+def write_agent_state(config, last_loop_started_at=None, last_loop_finished_at=None, last_error=None):
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    save_json(
+        AGENT_STATE_FILE,
+        build_agent_state(
+            config,
+            last_loop_started_at=last_loop_started_at,
+            last_loop_finished_at=last_loop_finished_at,
+            last_error=last_error,
+        ),
+    )
 
 
 def load_catalog():
@@ -360,12 +391,36 @@ def run_agent_loop(stop_event=None):
         config.get("agent_version"),
     )
     write_log("Systemo Agent started")
+    write_agent_state(config)
 
     while stop_event is None or not stop_event.is_set():
+        loop_started_at = utc_now()
+        last_error = None
+        write_agent_state(
+            config,
+            last_loop_started_at=loop_started_at,
+            last_loop_finished_at=None,
+            last_error=None,
+        )
+
         try:
             process_pending_jobs()
-        except Exception:
+        except Exception as error:
+            last_error = str(error)
             LOGGER.exception("Agent loop failed")
+            write_agent_state(
+                config,
+                last_loop_started_at=loop_started_at,
+                last_loop_finished_at=utc_now(),
+                last_error=traceback.format_exc(),
+            )
+        else:
+            write_agent_state(
+                config,
+                last_loop_started_at=loop_started_at,
+                last_loop_finished_at=utc_now(),
+                last_error=last_error,
+            )
 
         if stop_event is None:
             time.sleep(POLL_SECONDS)

@@ -112,6 +112,12 @@ View local agent identity and config:
 python .\agent_cli.py info
 ```
 
+Check local heartbeat health:
+
+```powershell
+python .\agent_cli.py health
+```
+
 To test installed-app detection:
 
 1. Add a VLC job and let the agent install VLC.
@@ -193,6 +199,7 @@ The scheduled task runs `scripts\start_agent.ps1`, which activates `.venv`, runs
 - Run PowerShell as Administrator when installing or uninstalling the scheduled task.
 - Check `logs/task-runner.log` for Task Scheduler runner output.
 - Check `logs/agent.log` for agent job processing logs.
+- Run `python .\agent_cli.py health` to verify the background agent heartbeat.
 - Open Task Scheduler and check Task Scheduler Library > Systemo Agent.
 - During MVP testing, if a blank PowerShell window appears, do not close it because it is the background agent runner. Later packaging will hide this window properly.
 - If the old pywin32 service was installed during earlier testing, remove it from an Administrator PowerShell with `sc.exe delete SystemoAgent`.
@@ -256,3 +263,25 @@ Edit `jobs.json` so it contains a pending Chrome install job:
 - `updated_at`
 
 Do not store secrets in this file. Phase 3 is local-only and does not add a backend API, web app, or AI.
+
+## Agent Heartbeat
+
+The background agent writes `runtime/agent_state.json` when it starts and updates it every loop cycle. The state file includes:
+
+- `status`
+- `last_heartbeat_at`
+- `device_id`
+- `hostname`
+- `agent_version`
+- `current_pid`
+- `last_loop_started_at`
+- `last_loop_finished_at`
+- `last_error`
+
+Use this command to check whether the heartbeat is fresh:
+
+```powershell
+python .\agent_cli.py health
+```
+
+The health result is `healthy` when the heartbeat age is 15 seconds or less, `stale` when it is older than 15 seconds, and `missing` when `runtime/agent_state.json` does not exist.

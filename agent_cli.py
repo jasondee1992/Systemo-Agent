@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from agent import load_or_create_agent_config
+from agent import AGENT_STATE_FILE, load_or_create_agent_config
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -218,6 +218,55 @@ def print_info():
         print(f"{field}: {config.get(field) or '-'}")
 
 
+def parse_timestamp(timestamp):
+    if not timestamp:
+        return None
+
+    try:
+        return datetime.fromisoformat(timestamp)
+    except ValueError:
+        return None
+
+
+def get_heartbeat_age_seconds(last_heartbeat_at):
+    heartbeat_time = parse_timestamp(last_heartbeat_at)
+    if heartbeat_time is None:
+        return None
+
+    if heartbeat_time.tzinfo is None:
+        heartbeat_time = heartbeat_time.replace(tzinfo=timezone.utc)
+
+    return max(0, int((datetime.now(timezone.utc) - heartbeat_time).total_seconds()))
+
+
+def print_health():
+    config = load_or_create_agent_config()
+    state_exists = AGENT_STATE_FILE.exists()
+    state = load_json(AGENT_STATE_FILE, {}) if state_exists else {}
+    if not isinstance(state, dict):
+        state = {}
+
+    last_heartbeat_at = state.get("last_heartbeat_at")
+    heartbeat_age = get_heartbeat_age_seconds(last_heartbeat_at)
+
+    if not state_exists:
+        health_result = "missing"
+    elif heartbeat_age is not None and heartbeat_age <= 15:
+        health_result = "healthy"
+    else:
+        health_result = "stale"
+
+    print(f"agent_name: {config.get('agent_name') or '-'}")
+    print(f"agent_version: {state.get('agent_version') or config.get('agent_version') or '-'}")
+    print(f"device_id: {state.get('device_id') or config.get('device_id') or '-'}")
+    print(f"hostname: {state.get('hostname') or config.get('hostname') or '-'}")
+    print(f"status: {state.get('status') or '-'}")
+    print(f"current_pid: {state.get('current_pid') or '-'}")
+    print(f"last_heartbeat_at: {last_heartbeat_at or '-'}")
+    print(f"heartbeat_age_seconds: {heartbeat_age if heartbeat_age is not None else '-'}")
+    print(f"health_result: {health_result}")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Systemo Agent local test CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -228,6 +277,7 @@ def build_parser():
     subparsers.add_parser("status", help="Print current jobs")
     subparsers.add_parser("logs", help="Print the last 50 agent log lines")
     subparsers.add_parser("info", help="Print local agent identity and config")
+    subparsers.add_parser("health", help="Print local agent heartbeat health")
     subparsers.add_parser("list-jobs", help="Print all jobs newest first")
     subparsers.add_parser("clear-completed", help="Remove success and skipped jobs")
     subparsers.add_parser("clear-failed", help="Remove failed jobs")
@@ -254,6 +304,8 @@ def main():
             print_logs()
         elif args.command == "info":
             print_info()
+        elif args.command == "health":
+            print_health()
         elif args.command == "list-jobs":
             list_jobs()
         elif args.command == "clear-completed":
