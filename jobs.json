@@ -1,13 +1,24 @@
 [
   {
-    "id": "job-20260617014017-15865822",
-    "app": "vlc",
+    "id": "job-20260617065517-93da35fd",
+    "app": "7zip",
     "action": "install",
     "status": "skipped",
     "attempts": 1,
     "message": "Application is already installed",
-    "started_at": "2026-06-17T01:40:18.519936+00:00",
-    "finished_at": "2026-06-17T01:40:24.410697+00:00",
+    "started_at": "2026-06-17T06:55:19.633868+00:00",
+    "finished_at": "2026-06-17T06:55:20.790426+00:00",
     "last_error": null
+  },
+  {
+    "id": "job-20260617070559-0a034d9a",
+    "app": "7zip",
+    "action": "uninstall",
+    "status": "failed",
+    "attempts": 1,
+    "message": "Application uninstall failed",
+    "started_at": "2026-06-17T07:06:01.885659+00:00",
+    "finished_at": "2026-06-17T07:06:03.431725+00:00",
+    "last_error": "- \n                                                                                                                        \nMultiple versions of this package are installed. Either refine the search, pass the `--version` argument to select one, or pass the `--all-versions` flag to uninstall all of them."
   }
 ]

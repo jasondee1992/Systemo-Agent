@@ -10,6 +10,7 @@ from agent import (
     CONFIG_FILE,
     DEFAULT_API_BASE_URL,
     DEFAULT_JOB_SOURCE,
+    detect_app_installation,
     load_or_create_agent_config,
     save_json,
 )
@@ -19,7 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent
 CATALOG_FILE = BASE_DIR / "app_catalog.json"
 JOBS_FILE = BASE_DIR / "jobs.json"
 AGENT_LOG_FILE = BASE_DIR / "logs" / "agent.log"
-ALLOWED_ACTION = "install"
+ALLOWED_ACTIONS = {"install", "uninstall"}
 COMPLETED_STATUSES = {"success", "skipped"}
 FAILED_STATUS = "failed"
 RETRY_MESSAGE = "Retry requested"
@@ -76,24 +77,32 @@ def get_api_base_url(config):
     return str(config.get("api_base_url") or DEFAULT_API_BASE_URL).rstrip("/")
 
 
-def add_job(app):
+def validate_app_action(app, action):
     catalog = load_catalog()
     if app not in catalog:
         approved_apps = ", ".join(sorted(catalog.keys())) or "<none>"
         raise ValueError(f"Unsupported app '{app}'. Approved apps: {approved_apps}")
 
+    if action not in ALLOWED_ACTIONS:
+        approved_actions = ", ".join(sorted(ALLOWED_ACTIONS))
+        raise ValueError(f"Unsupported action '{action}'. Approved actions: {approved_actions}")
+
+
+def add_job(app, action="install"):
+    validate_app_action(app, action)
+
     jobs = load_jobs()
     job = {
         "id": f"job-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}",
         "app": app,
-        "action": ALLOWED_ACTION,
+        "action": action,
         "status": "pending",
         "attempts": 0,
         "message": None,
     }
     jobs.append(job)
     save_jobs(jobs)
-    print(f"Added job {job['id']} for {app} install")
+    print(f"Added job {job['id']} for {app} {action}")
 
 
 def print_mode():
@@ -113,22 +122,19 @@ def set_mode(mode):
     print(f"Job source set to {mode}.")
 
 
-def api_add_job(app):
-    catalog = load_catalog()
-    if app not in catalog:
-        approved_apps = ", ".join(sorted(catalog.keys())) or "<none>"
-        raise ValueError(f"Unsupported app '{app}'. Approved apps: {approved_apps}")
+def api_add_job(app, action="install"):
+    validate_app_action(app, action)
 
     config = load_or_create_agent_config()
     requests = get_requests_module()
     response = requests.post(
         f"{get_api_base_url(config)}/api/agent/jobs",
-        json={"device_id": "any", "app": app, "action": ALLOWED_ACTION},
+        json={"device_id": "any", "app": app, "action": action},
         timeout=10,
     )
     response.raise_for_status()
     job = response.json()
-    print(f"Created API job {job.get('id')} for {app} install")
+    print(f"Created API job {job.get('id')} for {app} {action}")
 
 
 def api_list_jobs():
@@ -140,6 +146,20 @@ def api_list_jobs():
     if not isinstance(jobs, list):
         raise ValueError("API jobs response must be a JSON array")
     print_jobs(list(reversed(jobs)))
+
+
+def detect_app(app):
+    catalog = load_catalog()
+    if app not in catalog:
+        approved_apps = ", ".join(sorted(catalog.keys())) or "<none>"
+        raise ValueError(f"Unsupported app '{app}'. Approved apps: {approved_apps}")
+
+    result = detect_app_installation(app)
+    print(f"app: {app}")
+    print(f"installed: {str(result.get('installed')).lower()}")
+    print(f"winget_id: {result.get('winget_id') or '-'}")
+    print(f"return_code: {result.get('return_code') if result.get('return_code') is not None else '-'}")
+    print(f"output_preview: {result.get('output_preview') or '-'}")
 
 
 def get_job_value(job, field):
@@ -177,7 +197,7 @@ def validate_retry_job(job):
             f"Cannot retry job with unsupported app '{app}'. Approved apps: {approved_apps}"
         )
 
-    if action != ALLOWED_ACTION:
+    if action not in ALLOWED_ACTIONS:
         raise ValueError(f"Cannot retry unsupported action '{action}'")
 
 
@@ -334,8 +354,9 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Systemo Agent local test CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    add_job_parser = subparsers.add_parser("add-job", help="Append an approved install job")
+    add_job_parser = subparsers.add_parser("add-job", help="Append an approved job")
     add_job_parser.add_argument("app")
+    add_job_parser.add_argument("action", nargs="?", default="install", choices=sorted(ALLOWED_ACTIONS))
 
     subparsers.add_parser("mode", help="Print current job source mode")
 
@@ -344,8 +365,12 @@ def build_parser():
 
     api_add_job_parser = subparsers.add_parser("api-add-job", help="Create an approved mock API job")
     api_add_job_parser.add_argument("app")
+    api_add_job_parser.add_argument("action", nargs="?", default="install", choices=sorted(ALLOWED_ACTIONS))
 
     subparsers.add_parser("api-list-jobs", help="List mock API jobs")
+
+    detect_parser = subparsers.add_parser("detect", help="Run approved app detection")
+    detect_parser.add_argument("app")
 
     subparsers.add_parser("status", help="Print current jobs")
     subparsers.add_parser("logs", help="Print the last 50 agent log lines")
@@ -370,15 +395,17 @@ def main():
 
     try:
         if args.command == "add-job":
-            add_job(args.app)
+            add_job(args.app, args.action)
         elif args.command == "mode":
             print_mode()
         elif args.command == "set-mode":
             set_mode(args.mode)
         elif args.command == "api-add-job":
-            api_add_job(args.app)
+            api_add_job(args.app, args.action)
         elif args.command == "api-list-jobs":
             api_list_jobs()
+        elif args.command == "detect":
+            detect_app(args.app)
         elif args.command == "status":
             print_status()
         elif args.command == "logs":

@@ -11,8 +11,8 @@ from pydantic import BaseModel
 BASE_DIR = Path(__file__).resolve().parent
 BACKEND_DIR = BASE_DIR / "mock_backend"
 JOBS_FILE = BACKEND_DIR / "jobs.json"
-ALLOWED_APPS = {"vlc", "chrome"}
-ALLOWED_ACTIONS = {"install"}
+ALLOWED_APPS = {"vlc", "chrome", "7zip"}
+ALLOWED_ACTIONS = {"install", "uninstall"}
 
 app = FastAPI(title="Systemo Agent Mock Backend")
 

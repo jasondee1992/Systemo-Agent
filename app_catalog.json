@@ -7,6 +7,13 @@
       "--accept-package-agreements",
       "--accept-source-agreements"
     ],
+    "uninstall_args": [
+      "--exact",
+      "--silent",
+      "--disable-interactivity",
+      "--accept-source-agreements"
+    ],
+    "supports_silent_uninstall": false,
     "detection_method": "winget",
     "detection_id": "VideoLAN.VLC"
   },
@@ -18,7 +25,34 @@
       "--accept-package-agreements",
       "--accept-source-agreements"
     ],
+    "uninstall_args": [
+      "--exact",
+      "--silent",
+      "--disable-interactivity",
+      "--accept-source-agreements"
+    ],
+    "supports_silent_uninstall": true,
     "detection_method": "winget",
     "detection_id": "Google.Chrome"
+  },
+  "7zip": {
+    "display_name": "7-Zip",
+    "winget_id": "7zip.7zip",
+    "install_args": [
+      "--silent",
+      "--accept-package-agreements",
+      "--accept-source-agreements"
+    ],
+    "uninstall_args": [
+      "--exact",
+      "--silent",
+      "--disable-interactivity",
+      "--all-versions",
+      "--accept-source-agreements"
+    ],
+    "uninstall_all_versions": true,
+    "supports_silent_uninstall": true,
+    "detection_method": "winget",
+    "detection_id": "7zip.7zip"
   }
 }

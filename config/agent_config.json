@@ -1,12 +1,12 @@
 {
   "device_id": "778e994a-7683-462b-b101-e49cba48d4c7",
   "created_at": "2026-06-17T00:17:21.758792+00:00",
-  "updated_at": "2026-06-17T04:05:27.835460+00:00",
+  "updated_at": "2026-06-17T06:53:32.010990+00:00",
   "hostname": "UDOT",
   "os": "Windows-10-10.0.26200-SP0",
   "username": "JasonD",
   "agent_name": "Systemo Agent",
   "agent_version": "0.3.0",
-  "job_source": "api",
+  "job_source": "local",
   "api_base_url": "http://127.0.0.1:8008"
 }

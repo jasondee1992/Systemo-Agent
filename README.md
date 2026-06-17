@@ -1,8 +1,8 @@
 # Systemo Agent
 
-Phase 1 is a local Windows desktop agent MVP. It watches `jobs.json` and installs approved applications with `winget`.
+Phase 1 is a local Windows desktop agent MVP. It watches `jobs.json` and installs or uninstalls approved applications with `winget`.
 
-There is no web app, no AI, and no arbitrary command execution in this phase. Jobs can only request approved apps and actions. The actual commands are loaded from `app_catalog.json`.
+There is no web app, no AI, and no arbitrary command execution in this phase. Jobs can only request approved apps and actions. The actual install and uninstall commands are loaded from `app_catalog.json`.
 
 ## Requirements
 
@@ -62,6 +62,24 @@ Add a Chrome install job:
 
 ```powershell
 python .\agent_cli.py add-job chrome
+```
+
+Add a 7-Zip install job:
+
+```powershell
+python .\agent_cli.py add-job 7zip install
+```
+
+Add a 7-Zip uninstall job:
+
+```powershell
+python .\agent_cli.py add-job 7zip uninstall
+```
+
+Add a VLC uninstall job:
+
+```powershell
+python .\agent_cli.py add-job vlc uninstall
 ```
 
 Check job status:
@@ -124,6 +142,14 @@ Show current job source mode:
 python .\agent_cli.py mode
 ```
 
+Run installed-app detection:
+
+```powershell
+python .\agent_cli.py detect vlc
+python .\agent_cli.py detect chrome
+python .\agent_cli.py detect 7zip
+```
+
 To test installed-app detection:
 
 1. Add a VLC job and let the agent install VLC.
@@ -170,6 +196,14 @@ Add a test VLC job to the mock API:
 python .\agent_cli.py api-add-job vlc
 ```
 
+Add API install/uninstall test jobs:
+
+```powershell
+python .\agent_cli.py api-add-job vlc uninstall
+python .\agent_cli.py api-add-job 7zip install
+python .\agent_cli.py api-add-job 7zip uninstall
+```
+
 List API jobs:
 
 ```powershell
@@ -190,10 +224,37 @@ python .\agent_cli.py set-mode local
 
 In API mode, the agent polls `GET /api/agent/jobs?device_id=<device_id>`, processes only jobs with `status` set to `approved`, and reports final results to `POST /api/agent/jobs/{job_id}/result`. API jobs are not copied into local `jobs.json`.
 
+To test VLC detection after uninstall:
+
+```powershell
+winget uninstall --id VideoLAN.VLC
+python .\agent_cli.py detect vlc
+```
+
+Expected detection result:
+
+```text
+installed: false
+```
+
+Then add a new API job:
+
+```powershell
+python .\agent_cli.py api-add-job vlc
+python .\agent_cli.py api-list-jobs
+```
+
+Expected job result after the agent processes it:
+
+```text
+status: success
+```
+
 Job management examples:
 
 ```powershell
-python .\agent_cli.py add-job vlc
+python .\agent_cli.py add-job vlc install
+python .\agent_cli.py add-job 7zip uninstall
 python .\agent_cli.py list-jobs
 python .\agent_cli.py show-job job-20260617010101-abcd1234
 python .\agent_cli.py clear-completed
@@ -256,6 +317,7 @@ The scheduled task runs `scripts\start_agent.ps1`, which activates `.venv`, runs
 - Check `logs/agent.log` for agent job processing logs.
 - Run `python .\agent_cli.py health` to verify the background agent heartbeat.
 - Open Task Scheduler and check Task Scheduler Library > Systemo Agent.
+- If `winget` reports multiple versions installed during uninstall, the approved catalog can include `uninstall_all_versions` for that app. For 7-Zip, the catalog includes this so uninstall uses `--all-versions`.
 - During MVP testing, if a blank PowerShell window appears, do not close it because it is the background agent runner. Later packaging will hide this window properly.
 - If the old pywin32 service was installed during earlier testing, remove it from an Administrator PowerShell with `sc.exe delete SystemoAgent`.
 
@@ -291,18 +353,41 @@ Edit `jobs.json` so it contains a pending Chrome install job:
 ]
 ```
 
+## Trigger 7-Zip uninstall
+
+Edit `jobs.json` so it contains a pending 7-Zip uninstall job:
+
+```json
+[
+  {
+    "id": "job-003",
+    "app": "7zip",
+    "action": "uninstall",
+    "status": "pending"
+  }
+]
+```
+
 ## Job behavior
 
 - Only jobs with `"status": "pending"` are processed.
-- Only `"action": "install"` is allowed.
+- Only `"action": "install"` and `"action": "uninstall"` are allowed.
 - Only apps listed in `app_catalog.json` are allowed.
-- Before installing, the agent checks `winget list --id <winget_id> --accept-source-agreements`.
+- Before installing, the agent checks `winget list --id <winget_id> --exact --accept-source-agreements`.
 - If the app is already installed, the job status changes to `"skipped"` and no install command is run.
 - Before installation, the job status changes to `"installing"`.
 - Successful installs change the job status to `"success"`.
 - Failed installs change the job status to `"failed"` and save the error in `last_error`.
+- Before uninstalling, the agent checks whether the app is installed.
+- If the app is not installed, the uninstall job status changes to `"skipped"` and no uninstall command is run.
+- Uninstall jobs use only the approved catalog command: `winget uninstall --id <winget_id> --exact --silent --disable-interactivity --accept-source-agreements`.
+- Apps that explicitly set `uninstall_all_versions` in `app_catalog.json` also include `--all-versions`; this is enabled for 7-Zip to handle machines with multiple installed versions.
+- Successful uninstalls change the job status to `"success"`.
+- If uninstall needs UI interaction or the user cancels it, the job status changes to `"requires_user_action"` or `"failed"` with a clear message and `last_error`.
 - Each processed job receives `started_at`, `finished_at`, `message`, `attempts`, and `last_error` fields.
 - `attempts` increments once when a pending job is processed. Failed jobs are not retried automatically yet.
+
+Use 7-Zip as the primary install/uninstall automation test app. VLC uninstall may show UI on some machines.
 
 ## Agent Config
 

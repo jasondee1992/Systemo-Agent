@@ -21,7 +21,7 @@ JOBS_FILE = BASE_DIR / "jobs.json"
 CATALOG_FILE = BASE_DIR / "app_catalog.json"
 LOG_FILE = BASE_DIR / "logs" / "agent.log"
 POLL_SECONDS = 5
-ALLOWED_ACTIONS = {"install"}
+ALLOWED_ACTIONS = {"install", "uninstall"}
 AGENT_NAME = "Systemo Agent"
 AGENT_VERSION = "0.3.0"
 DEFAULT_JOB_SOURCE = "local"
@@ -193,7 +193,7 @@ def get_next_attempt_count(job):
 
 
 def get_catalog_command(catalog, app, action):
-    if action != "install":
+    if action not in ALLOWED_ACTIONS:
         return None
 
     app_entry = catalog.get(app)
@@ -201,16 +201,31 @@ def get_catalog_command(catalog, app, action):
         return None
 
     winget_id = app_entry.get("winget_id")
-    install_args = app_entry.get("install_args", [])
+    args_key = f"{action}_args"
+    action_args = app_entry.get(args_key, [])
     if not isinstance(winget_id, str) or not winget_id:
         return None
 
-    if not isinstance(install_args, list) or not all(
-        isinstance(arg, str) for arg in install_args
+    if not isinstance(action_args, list) or not all(
+        isinstance(arg, str) for arg in action_args
     ):
         return None
 
-    return ["winget", "install", "--id", winget_id, *install_args]
+    action_args = list(action_args)
+    uninstall_all_versions = app_entry.get("uninstall_all_versions") is True
+    if action == "uninstall":
+        has_all_versions_arg = "--all-versions" in action_args
+        if has_all_versions_arg and not uninstall_all_versions:
+            return None
+
+        if uninstall_all_versions and not has_all_versions_arg:
+            try:
+                insert_at = action_args.index("--accept-source-agreements")
+            except ValueError:
+                insert_at = len(action_args)
+            action_args.insert(insert_at, "--all-versions")
+
+    return ["winget", action, "--id", winget_id, *action_args]
 
 
 def get_detection_command(catalog, app):
@@ -231,17 +246,31 @@ def get_detection_command(catalog, app):
         "list",
         "--id",
         detection_id,
+        "--exact",
         "--accept-source-agreements",
     ]
 
 
-def is_app_installed(app_key):
+def sanitize_output_preview(output, max_length=500):
+    preview = " ".join((output or "").split())
+    if len(preview) > max_length:
+        return f"{preview[:max_length]}..."
+    return preview
+
+
+def detect_app_installation(app_key):
     setup_logging()
     catalog = load_catalog()
     command = get_detection_command(catalog, app_key)
     if command is None:
         LOGGER.warning("Detection failed for %s: no approved detection command", app_key)
-        return False
+        return {
+            "installed": False,
+            "winget_id": None,
+            "return_code": None,
+            "output_preview": "No approved detection command",
+            "command": None,
+        }
 
     detection_id = catalog[app_key]["detection_id"]
     try:
@@ -254,21 +283,44 @@ def is_app_installed(app_key):
         )
     except Exception:
         LOGGER.exception("Detection failed for %s", app_key)
-        return False
+        return {
+            "installed": False,
+            "winget_id": detection_id,
+            "return_code": None,
+            "output_preview": "Detection command failed to run",
+            "command": command,
+        }
 
-    output = "\n".join(
-        part.strip()
-        for part in [completed.stdout, completed.stderr]
-        if part and part.strip()
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
+    combined_output = "\n".join(part.strip() for part in [stdout, stderr] if part.strip())
+    output_preview = sanitize_output_preview(combined_output)
+    installed = completed.returncode == 0 and detection_id in stdout
+
+    LOGGER.info(
+        "Detection command for %s: %s",
+        app_key,
+        " ".join(command),
     )
-    installed = detection_id.lower() in output.lower()
+    LOGGER.info(
+        "Detection result for %s: installed=%s return_code=%s output_preview=%s",
+        app_key,
+        installed,
+        completed.returncode,
+        output_preview,
+    )
 
-    if installed:
-        LOGGER.info("Detection result for %s: installed", app_key)
-    else:
-        LOGGER.info("Detection result for %s: not installed", app_key)
+    return {
+        "installed": installed,
+        "winget_id": detection_id,
+        "return_code": completed.returncode,
+        "output_preview": output_preview,
+        "command": command,
+    }
 
-    return installed
+
+def is_app_installed(app_key):
+    return detect_app_installation(app_key)["installed"]
 
 
 def validate_job(job, catalog):
@@ -294,7 +346,15 @@ def validate_job(job, catalog):
     return None
 
 
-def run_install(command):
+def get_completed_output(completed):
+    return "\n".join(
+        part.strip()
+        for part in [completed.stdout, completed.stderr]
+        if part and part.strip()
+    )
+
+
+def run_winget_command(command):
     completed = subprocess.run(
         command,
         capture_output=True,
@@ -304,12 +364,31 @@ def run_install(command):
     )
 
     if completed.returncode != 0:
-        output = "\n".join(
-            part.strip()
-            for part in [completed.stdout, completed.stderr]
-            if part and part.strip()
-        )
+        output = get_completed_output(completed)
         raise RuntimeError(output or f"Command failed with exit code {completed.returncode}")
+
+    return completed
+
+
+def run_install(command):
+    return run_winget_command(command)
+
+
+def is_uninstall_user_action_required(error_output):
+    normalized_output = (error_output or "").lower()
+    user_action_markers = [
+        "cancelled",
+        "canceled",
+        "requires user",
+        "requires interaction",
+        "requires interactivity",
+        "user interaction",
+        "user input",
+        "interactive",
+        "silent",
+        "ui",
+    ]
+    return any(marker in normalized_output for marker in user_action_markers)
 
 
 def save_local_job_state(jobs):
@@ -353,8 +432,9 @@ def process_job_record(job, catalog, expected_status, save_state=None):
         return job
 
     command = get_catalog_command(catalog, app, action)
+    installed = is_app_installed(app)
 
-    if is_app_installed(app):
+    if action == "install" and installed:
         job["status"] = "skipped"
         job["message"] = "Application is already installed"
         job["last_error"] = None
@@ -363,24 +443,44 @@ def process_job_record(job, catalog, expected_status, save_state=None):
         LOGGER.info("Job %s skipped: %s is already installed", job_id, app)
         return job
 
-    job["status"] = "installing"
+    if action == "uninstall" and not installed:
+        job["status"] = "skipped"
+        job["message"] = "Application is not installed"
+        job["last_error"] = None
+        job["finished_at"] = utc_now()
+        persist()
+        LOGGER.info("Job %s skipped: %s is not installed", job_id, app)
+        return job
+
+    running_status = "installing" if action == "install" else "uninstalling"
+    present_tense_action = "Installing" if action == "install" else "Uninstalling"
+    past_tense_action = "installed" if action == "install" else "uninstalled"
+
+    job["status"] = running_status
     job["finished_at"] = None
     job["last_error"] = None
-    job["message"] = "Installing application"
+    job["message"] = f"{present_tense_action} application"
     persist()
     LOGGER.info("Job %s started: %s %s", job_id, action, app)
 
     try:
-        run_install(command)
+        run_winget_command(command)
         job["status"] = "success"
         job["last_error"] = None
-        job["message"] = "Application installed successfully"
+        job["message"] = f"Application {past_tense_action} successfully"
         LOGGER.info("Job %s succeeded", job_id)
     except Exception as error:
-        job["status"] = "failed"
-        job["last_error"] = str(error)
-        job["message"] = "Application installation failed"
-        LOGGER.exception("Job %s failed", job_id)
+        error_message = str(error)
+        if action == "uninstall" and is_uninstall_user_action_required(error_message):
+            job["status"] = "requires_user_action"
+            job["message"] = "Application uninstall requires user action"
+            LOGGER.warning("Job %s requires user action: %s", job_id, error_message)
+        else:
+            job["status"] = "failed"
+            job["message"] = f"Application {action} failed"
+            LOGGER.exception("Job %s failed", job_id)
+
+        job["last_error"] = error_message
     finally:
         job["finished_at"] = utc_now()
         persist()
