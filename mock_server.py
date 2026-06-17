@@ -122,6 +122,14 @@ def get_all_jobs():
     return load_jobs()
 
 
+@app.delete("/api/agent/jobs/all")
+def delete_all_jobs():
+    jobs = load_jobs()
+    removed_count = len(jobs)
+    save_jobs([])
+    return {"removed": removed_count}
+
+
 if __name__ == "__main__":
     import uvicorn
 

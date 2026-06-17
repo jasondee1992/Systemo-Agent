@@ -148,6 +148,24 @@ def api_list_jobs():
     print_jobs(list(reversed(jobs)))
 
 
+def api_clear_jobs(yes=False):
+    if not yes:
+        answer = input("Remove all mock API jobs? Type 'yes' to continue: ")
+        if answer.strip().lower() != "yes":
+            print("Canceled.")
+            return
+
+    config = load_or_create_agent_config()
+    requests = get_requests_module()
+    response = requests.delete(f"{get_api_base_url(config)}/api/agent/jobs/all", timeout=10)
+    response.raise_for_status()
+    result = response.json()
+    removed_count = result.get("removed")
+    if not isinstance(removed_count, int):
+        raise ValueError("API clear response missing removed count")
+    print(f"Removed {removed_count} API job(s).")
+
+
 def detect_app(app):
     catalog = load_catalog()
     if app not in catalog:
@@ -369,6 +387,9 @@ def build_parser():
 
     subparsers.add_parser("api-list-jobs", help="List mock API jobs")
 
+    api_clear_jobs_parser = subparsers.add_parser("api-clear-jobs", help="Remove all mock API jobs")
+    api_clear_jobs_parser.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
+
     detect_parser = subparsers.add_parser("detect", help="Run approved app detection")
     detect_parser.add_argument("app")
 
@@ -404,6 +425,8 @@ def main():
             api_add_job(args.app, args.action)
         elif args.command == "api-list-jobs":
             api_list_jobs()
+        elif args.command == "api-clear-jobs":
+            api_clear_jobs(args.yes)
         elif args.command == "detect":
             detect_app(args.app)
         elif args.command == "status":

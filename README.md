@@ -177,6 +177,8 @@ Run the mock server in a separate terminal:
 python mock_server.py
 ```
 
+After backend code changes, stop and restart `mock_server.py` so the new endpoints are loaded.
+
 Set the agent to API mode:
 
 ```powershell
@@ -188,6 +190,14 @@ Restart the Systemo Agent scheduled task:
 ```powershell
 Stop-ScheduledTask -TaskName "Systemo Agent"
 Start-ScheduledTask -TaskName "Systemo Agent"
+```
+
+After agent code changes, restart the scheduled task so the running background agent loads the latest `agent.py`.
+
+Clear mock API jobs:
+
+```powershell
+python .\agent_cli.py api-clear-jobs --yes
 ```
 
 Add a test VLC job to the mock API:
@@ -207,6 +217,16 @@ python .\agent_cli.py api-add-job 7zip uninstall
 List API jobs:
 
 ```powershell
+python .\agent_cli.py api-list-jobs
+```
+
+Recommended API install/uninstall test flow:
+
+```powershell
+python .\agent_cli.py api-clear-jobs --yes
+python .\agent_cli.py api-add-job 7zip install
+python .\agent_cli.py api-list-jobs
+python .\agent_cli.py api-add-job 7zip uninstall
 python .\agent_cli.py api-list-jobs
 ```
 

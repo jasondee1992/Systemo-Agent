@@ -126,6 +126,20 @@ def load_or_create_agent_config():
     return config
 
 
+def load_agent_config():
+    config = load_json(CONFIG_FILE, {})
+    if not isinstance(config, dict) or not config.get("device_id"):
+        return load_or_create_agent_config()
+
+    return {
+        **config,
+        "agent_name": config.get("agent_name") or AGENT_NAME,
+        "agent_version": config.get("agent_version") or AGENT_VERSION,
+        "job_source": config.get("job_source") or DEFAULT_JOB_SOURCE,
+        "api_base_url": config.get("api_base_url") or DEFAULT_API_BASE_URL,
+    }
+
+
 def build_agent_state(
     config,
     status="running",
@@ -533,6 +547,11 @@ def get_api_base_url(config):
 def fetch_api_jobs(config):
     requests = get_requests_module()
     api_base_url = get_api_base_url(config)
+    LOGGER.info(
+        "API poll started: url=%s device_id=%s",
+        f"{api_base_url}/api/agent/jobs",
+        config.get("device_id"),
+    )
     response = requests.get(
         f"{api_base_url}/api/agent/jobs",
         params={"device_id": config.get("device_id")},
@@ -542,6 +561,7 @@ def fetch_api_jobs(config):
     jobs = response.json()
     if not isinstance(jobs, list):
         raise ValueError("API jobs response must be a JSON array")
+    LOGGER.info("API jobs received count: %s", len(jobs))
     return jobs
 
 
@@ -566,11 +586,16 @@ def report_api_job_result(config, job):
         timeout=10,
     )
     response.raise_for_status()
+    LOGGER.info("API job result reported: %s status=%s", job_id, job.get("status"))
 
 
 def process_api_jobs(config):
     catalog = load_catalog()
-    jobs = fetch_api_jobs(config)
+    try:
+        jobs = fetch_api_jobs(config)
+    except Exception:
+        LOGGER.exception("API error: failed to poll jobs")
+        raise
 
     for api_job in jobs:
         if not isinstance(api_job, dict):
@@ -581,13 +606,27 @@ def process_api_jobs(config):
             LOGGER.info("API job %s skipped: status is not approved", get_job_label(api_job))
             continue
 
+        LOGGER.info(
+            "API job started: %s %s %s",
+            get_job_label(api_job),
+            api_job.get("app"),
+            api_job.get("action"),
+        )
         processed_job = process_job_record(api_job, catalog, "approved")
         if processed_job is not None:
-            report_api_job_result(config, processed_job)
+            try:
+                report_api_job_result(config, processed_job)
+            except Exception:
+                LOGGER.exception(
+                    "API error: failed to report result for job %s",
+                    get_job_label(processed_job),
+                )
+                raise
 
 
 def process_configured_job_source(config):
     job_source = config.get("job_source") or DEFAULT_JOB_SOURCE
+    LOGGER.info("Current job_source: %s", job_source)
     if job_source == "api":
         process_api_jobs(config)
     else:
@@ -607,6 +646,7 @@ def run_agent_loop(stop_event=None):
     write_log("Heartbeat enabled")
 
     while stop_event is None or not stop_event.is_set():
+        config = load_agent_config()
         loop_started_at = utc_now()
         write_agent_state(
             config,
@@ -617,7 +657,12 @@ def run_agent_loop(stop_event=None):
         )
 
         try:
-            process_configured_job_source(config)
+            job_source = config.get("job_source") or DEFAULT_JOB_SOURCE
+            LOGGER.info("Current job_source: %s", job_source)
+            if job_source == "api":
+                process_api_jobs(config)
+            else:
+                process_pending_jobs()
         except Exception:
             error_traceback = traceback.format_exc()
             LOGGER.exception("Agent loop failed")
