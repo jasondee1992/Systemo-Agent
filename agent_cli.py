@@ -35,6 +35,15 @@ JOB_DISPLAY_FIELDS = [
     "started_at",
     "finished_at",
 ]
+DEVICE_DISPLAY_FIELDS = [
+    "device_id",
+    "hostname",
+    "username",
+    "os",
+    "agent_version",
+    "status",
+    "last_seen_at",
+]
 
 
 def load_json(path, default):
@@ -164,6 +173,45 @@ def api_clear_jobs(yes=False):
     if not isinstance(removed_count, int):
         raise ValueError("API clear response missing removed count")
     print(f"Removed {removed_count} API job(s).")
+
+
+def print_device(device):
+    if not isinstance(device, dict):
+        print("- Invalid device entry")
+        return
+
+    print(f"- {get_job_value(device, 'device_id')}")
+    for field in DEVICE_DISPLAY_FIELDS[1:]:
+        print(f"  {field}: {get_job_value(device, field)}")
+
+
+def print_devices(devices):
+    if not devices:
+        print("No devices found.")
+        return
+
+    for device in devices:
+        print_device(device)
+
+
+def api_list_devices():
+    config = load_or_create_agent_config()
+    requests = get_requests_module()
+    response = requests.get(f"{get_api_base_url(config)}/api/devices", timeout=10)
+    response.raise_for_status()
+    devices = response.json()
+    if not isinstance(devices, list):
+        raise ValueError("API devices response must be a JSON array")
+    print_devices(devices)
+
+
+def api_show_device(device_id):
+    config = load_or_create_agent_config()
+    requests = get_requests_module()
+    response = requests.get(f"{get_api_base_url(config)}/api/devices/{device_id}", timeout=10)
+    response.raise_for_status()
+    device = response.json()
+    print_device(device)
 
 
 def detect_app(app):
@@ -366,6 +414,10 @@ def print_health():
     print(f"last_heartbeat_at: {last_heartbeat_at or '-'}")
     print(f"heartbeat_age_seconds: {heartbeat_age if heartbeat_age is not None else '-'}")
     print(f"health_result: {health_result}")
+    job_source = config.get("job_source") or DEFAULT_JOB_SOURCE
+    print(f"job_source: {job_source}")
+    if job_source == "api":
+        print(f"api_base_url: {config.get('api_base_url') or DEFAULT_API_BASE_URL}")
 
 
 def build_parser():
@@ -389,6 +441,11 @@ def build_parser():
 
     api_clear_jobs_parser = subparsers.add_parser("api-clear-jobs", help="Remove all mock API jobs")
     api_clear_jobs_parser.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
+
+    subparsers.add_parser("api-list-devices", help="List mock API devices")
+
+    api_show_device_parser = subparsers.add_parser("api-show-device", help="Show one mock API device")
+    api_show_device_parser.add_argument("device_id")
 
     detect_parser = subparsers.add_parser("detect", help="Run approved app detection")
     detect_parser.add_argument("app")
@@ -427,6 +484,10 @@ def main():
             api_list_jobs()
         elif args.command == "api-clear-jobs":
             api_clear_jobs(args.yes)
+        elif args.command == "api-list-devices":
+            api_list_devices()
+        elif args.command == "api-show-device":
+            api_show_device(args.device_id)
         elif args.command == "detect":
             detect_app(args.app)
         elif args.command == "status":

@@ -11,6 +11,7 @@ from pydantic import BaseModel
 BASE_DIR = Path(__file__).resolve().parent
 BACKEND_DIR = BASE_DIR / "mock_backend"
 JOBS_FILE = BACKEND_DIR / "jobs.json"
+DEVICES_FILE = BACKEND_DIR / "devices.json"
 ALLOWED_APPS = {"vlc", "chrome", "7zip"}
 ALLOWED_ACTIONS = {"install", "uninstall"}
 
@@ -30,6 +31,16 @@ class JobResultRequest(BaseModel):
     last_error: Optional[str] = None
     message: Optional[str] = None
     attempts: Optional[int] = None
+
+
+class DeviceCheckInRequest(BaseModel):
+    device_id: str
+    hostname: Optional[str] = None
+    username: Optional[str] = None
+    os: Optional[str] = None
+    agent_name: str = "Systemo Agent"
+    agent_version: str = "0.3.0"
+    status: str = "online"
 
 
 def utc_now():
@@ -58,6 +69,30 @@ def save_jobs(jobs):
         json.dump(jobs, file, indent=2)
         file.write("\n")
     temp_file.replace(JOBS_FILE)
+
+
+def load_devices():
+    BACKEND_DIR.mkdir(parents=True, exist_ok=True)
+    if not DEVICES_FILE.exists():
+        save_devices([])
+        return []
+
+    with DEVICES_FILE.open("r", encoding="utf-8") as file:
+        devices = json.load(file)
+
+    if not isinstance(devices, list):
+        raise HTTPException(status_code=500, detail="mock_backend/devices.json must contain an array")
+
+    return devices
+
+
+def save_devices(devices):
+    BACKEND_DIR.mkdir(parents=True, exist_ok=True)
+    temp_file = DEVICES_FILE.with_suffix(".json.tmp")
+    with temp_file.open("w", encoding="utf-8") as file:
+        json.dump(devices, file, indent=2)
+        file.write("\n")
+    temp_file.replace(DEVICES_FILE)
 
 
 @app.get("/health")
@@ -128,6 +163,44 @@ def delete_all_jobs():
     removed_count = len(jobs)
     save_jobs([])
     return {"removed": removed_count}
+
+
+@app.post("/api/agent/check-in")
+def check_in_device(request: DeviceCheckInRequest):
+    devices = load_devices()
+    now = utc_now()
+    device_update = request.dict()
+    device_update["last_seen_at"] = now
+
+    for device in devices:
+        if isinstance(device, dict) and device.get("device_id") == request.device_id:
+            device.update(device_update)
+            save_devices(devices)
+            return device
+
+    devices.append(device_update)
+    save_devices(devices)
+    return device_update
+
+
+@app.get("/api/devices")
+def get_devices():
+    devices = load_devices()
+    return sorted(
+        devices,
+        key=lambda device: device.get("last_seen_at", "") if isinstance(device, dict) else "",
+        reverse=True,
+    )
+
+
+@app.get("/api/devices/{device_id}")
+def get_device(device_id: str):
+    devices = load_devices()
+    for device in devices:
+        if isinstance(device, dict) and device.get("device_id") == device_id:
+            return device
+
+    raise HTTPException(status_code=404, detail="Device not found")
 
 
 if __name__ == "__main__":

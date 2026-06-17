@@ -589,6 +589,34 @@ def report_api_job_result(config, job):
     LOGGER.info("API job result reported: %s status=%s", job_id, job.get("status"))
 
 
+def check_in_with_api(config):
+    requests = get_requests_module()
+    api_base_url = get_api_base_url(config)
+    payload = {
+        "device_id": config.get("device_id"),
+        "hostname": config.get("hostname"),
+        "username": config.get("username"),
+        "os": config.get("os"),
+        "agent_name": config.get("agent_name") or AGENT_NAME,
+        "agent_version": config.get("agent_version") or AGENT_VERSION,
+        "status": "online",
+    }
+    response = requests.post(
+        f"{api_base_url}/api/agent/check-in",
+        json=payload,
+        timeout=10,
+    )
+    response.raise_for_status()
+    LOGGER.info("API check-in succeeded: device_id=%s", config.get("device_id"))
+
+
+def try_api_check_in(config):
+    try:
+        check_in_with_api(config)
+    except Exception:
+        LOGGER.exception("API check-in failed")
+
+
 def process_api_jobs(config):
     catalog = load_catalog()
     try:
@@ -628,6 +656,7 @@ def process_configured_job_source(config):
     job_source = config.get("job_source") or DEFAULT_JOB_SOURCE
     LOGGER.info("Current job_source: %s", job_source)
     if job_source == "api":
+        try_api_check_in(config)
         process_api_jobs(config)
     else:
         process_pending_jobs()
@@ -660,6 +689,7 @@ def run_agent_loop(stop_event=None):
             job_source = config.get("job_source") or DEFAULT_JOB_SOURCE
             LOGGER.info("Current job_source: %s", job_source)
             if job_source == "api":
+                try_api_check_in(config)
                 process_api_jobs(config)
             else:
                 process_pending_jobs()

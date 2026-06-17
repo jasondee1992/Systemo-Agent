@@ -1,0 +1,12 @@
+[
+  {
+    "device_id": "778e994a-7683-462b-b101-e49cba48d4c7",
+    "hostname": "UDOT",
+    "username": "JasonD",
+    "os": "Windows-10-10.0.26200-SP0",
+    "agent_name": "Systemo Agent",
+    "agent_version": "0.3.0",
+    "status": "online",
+    "last_seen_at": "2026-06-17T08:01:21.189151+00:00"
+  }
+]

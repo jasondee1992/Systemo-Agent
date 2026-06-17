@@ -244,6 +244,33 @@ python .\agent_cli.py set-mode local
 
 In API mode, the agent polls `GET /api/agent/jobs?device_id=<device_id>`, processes only jobs with `status` set to `approved`, and reports final results to `POST /api/agent/jobs/{job_id}/result`. API jobs are not copied into local `jobs.json`.
 
+## Phase 7 Device Registration
+
+When the agent is in API mode, it checks in with the mock backend using `POST /api/agent/check-in`. The backend stores known devices in `mock_backend/devices.json` and updates `last_seen_at` on each check-in.
+
+Test device registration:
+
+```powershell
+python mock_server.py
+python .\agent_cli.py set-mode api
+Stop-ScheduledTask -TaskName "Systemo Agent"
+Start-ScheduledTask -TaskName "Systemo Agent"
+```
+
+Wait 10-20 seconds, then list registered devices:
+
+```powershell
+python .\agent_cli.py api-list-devices
+```
+
+Show one device:
+
+```powershell
+python .\agent_cli.py api-show-device <device_id>
+```
+
+Verify that your local `device_id` appears and that `last_seen_at` updates while the agent is running in API mode.
+
 To test VLC detection after uninstall:
 
 ```powershell
