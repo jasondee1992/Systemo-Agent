@@ -11,5 +11,18 @@
     "last_error": null,
     "message": "Application is already installed",
     "attempts": 1
+  },
+  {
+    "id": "job-20260617040457-3ec0884b",
+    "device_id": "any",
+    "app": "vlc",
+    "action": "install",
+    "status": "skipped",
+    "created_at": "2026-06-17T04:04:57.605565+00:00",
+    "started_at": "2026-06-17T04:04:58.470864+00:00",
+    "finished_at": "2026-06-17T04:04:59.873836+00:00",
+    "last_error": null,
+    "message": "Application is already installed",
+    "attempts": 1
   }
 ]
