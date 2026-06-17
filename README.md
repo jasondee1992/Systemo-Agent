@@ -36,6 +36,8 @@ powershell -ExecutionPolicy Bypass -File .\install_systemo_agent.ps1
 
 The installer creates `.venv` if needed, installs `requirements.txt`, registers the scheduled task, starts it, and writes installer output to `logs/installer.log`.
 
+On startup, Systemo Agent creates or updates `config/agent_config.json`. This file stores the local agent identity, including a stable `device_id`, hostname, OS, username when available, and the agent version. The `device_id` is generated once for this installed agent and is kept across restarts so the same client computer can be identified consistently later.
+
 Check whether the background task is running:
 
 ```powershell
@@ -72,6 +74,12 @@ View agent logs:
 
 ```powershell
 python .\agent_cli.py logs
+```
+
+View local agent identity and config:
+
+```powershell
+python .\agent_cli.py info
 ```
 
 To test installed-app detection:
@@ -191,3 +199,18 @@ Edit `jobs.json` so it contains a pending Chrome install job:
 - Failed installs change the job status to `"failed"` and save the error in `last_error`.
 - Each processed job receives `started_at`, `finished_at`, `message`, `attempts`, and `last_error` fields.
 - `attempts` increments once when a pending job is processed. Failed jobs are not retried automatically yet.
+
+## Agent Config
+
+`config/agent_config.json` is created automatically if it does not exist. It contains:
+
+- `agent_name`
+- `agent_version`
+- `device_id`
+- `hostname`
+- `os`
+- `username`
+- `created_at`
+- `updated_at`
+
+Do not store secrets in this file. Phase 3 is local-only and does not add a backend API, web app, or AI.

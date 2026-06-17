@@ -5,6 +5,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from agent import load_or_create_agent_config
+
 
 BASE_DIR = Path(__file__).resolve().parent
 CATALOG_FILE = BASE_DIR / "app_catalog.json"
@@ -103,6 +105,23 @@ def print_logs():
         print(line.rstrip())
 
 
+def print_info():
+    config = load_or_create_agent_config()
+    fields = [
+        "agent_name",
+        "agent_version",
+        "device_id",
+        "hostname",
+        "os",
+        "username",
+        "created_at",
+        "updated_at",
+    ]
+
+    for field in fields:
+        print(f"{field}: {config.get(field) or '-'}")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Systemo Agent local test CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -112,6 +131,7 @@ def build_parser():
 
     subparsers.add_parser("status", help="Print current jobs")
     subparsers.add_parser("logs", help="Print the last 50 agent log lines")
+    subparsers.add_parser("info", help="Print local agent identity and config")
 
     return parser
 
@@ -127,6 +147,8 @@ def main():
             print_status()
         elif args.command == "logs":
             print_logs()
+        elif args.command == "info":
+            print_info()
         else:
             parser.error(f"Unknown command: {args.command}")
     except Exception as error:

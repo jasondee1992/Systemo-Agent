@@ -1,17 +1,25 @@
+import getpass
 import json
 import logging
+import platform
+import socket
 import subprocess
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 BASE_DIR = Path(__file__).resolve().parent
+CONFIG_DIR = BASE_DIR / "config"
+CONFIG_FILE = CONFIG_DIR / "agent_config.json"
 JOBS_FILE = BASE_DIR / "jobs.json"
 CATALOG_FILE = BASE_DIR / "app_catalog.json"
 LOG_FILE = BASE_DIR / "logs" / "agent.log"
 POLL_SECONDS = 5
 ALLOWED_ACTIONS = {"install"}
+AGENT_NAME = "Systemo Agent"
+AGENT_VERSION = "0.3.0"
 LOGGER = logging.getLogger("systemo_agent")
 
 
@@ -50,15 +58,60 @@ def load_json(path, default):
         return json.load(file)
 
 
+def save_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = path.with_suffix(f"{path.suffix}.tmp")
+    with temp_file.open("w", encoding="utf-8") as file:
+        json.dump(data, file, indent=2)
+        file.write("\n")
+    temp_file.replace(path)
+
+
 def save_jobs(jobs=None):
     if jobs is None:
         jobs = load_jobs()
 
-    temp_file = JOBS_FILE.with_suffix(".json.tmp")
-    with temp_file.open("w", encoding="utf-8") as file:
-        json.dump(jobs, file, indent=2)
-        file.write("\n")
-    temp_file.replace(JOBS_FILE)
+    save_json(JOBS_FILE, jobs)
+
+
+def get_username():
+    try:
+        return getpass.getuser()
+    except Exception:
+        return None
+
+
+def get_os_info():
+    return platform.platform()
+
+
+def load_or_create_agent_config():
+    now = utc_now()
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    config = load_json(CONFIG_FILE, {})
+    if not isinstance(config, dict):
+        config = {}
+
+    if not config.get("device_id"):
+        config["device_id"] = str(uuid.uuid4())
+
+    if not config.get("created_at"):
+        config["created_at"] = now
+
+    config.update(
+        {
+            "updated_at": now,
+            "hostname": socket.gethostname(),
+            "os": get_os_info(),
+            "username": get_username(),
+            "agent_name": AGENT_NAME,
+            "agent_version": AGENT_VERSION,
+        }
+    )
+
+    save_json(CONFIG_FILE, config)
+    return config
 
 
 def load_catalog():
@@ -299,6 +352,13 @@ def process_pending_jobs():
 
 def run_agent_loop(stop_event=None):
     setup_logging()
+    config = load_or_create_agent_config()
+    LOGGER.info(
+        "Agent identity loaded: device_id=%s hostname=%s agent_version=%s",
+        config.get("device_id"),
+        config.get("hostname"),
+        config.get("agent_version"),
+    )
     write_log("Systemo Agent started")
 
     while stop_event is None or not stop_event.is_set():
