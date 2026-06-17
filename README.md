@@ -74,6 +74,23 @@ View agent logs:
 python .\agent_cli.py logs
 ```
 
+To test installed-app detection:
+
+1. Add a VLC job and let the agent install VLC.
+2. Add another VLC job:
+
+```powershell
+python .\agent_cli.py add-job vlc
+```
+
+3. Check status:
+
+```powershell
+python .\agent_cli.py status
+```
+
+The second VLC job should become `skipped` with the message `Application is already installed`.
+
 ## Uninstall Systemo Agent
 
 Run from an Administrator PowerShell:
@@ -167,7 +184,10 @@ Edit `jobs.json` so it contains a pending Chrome install job:
 - Only jobs with `"status": "pending"` are processed.
 - Only `"action": "install"` is allowed.
 - Only apps listed in `app_catalog.json` are allowed.
+- Before installing, the agent checks `winget list --id <winget_id> --accept-source-agreements`.
+- If the app is already installed, the job status changes to `"skipped"` and no install command is run.
 - Before installation, the job status changes to `"installing"`.
 - Successful installs change the job status to `"success"`.
 - Failed installs change the job status to `"failed"` and save the error in `last_error`.
-- Each processed job receives `started_at`, `finished_at`, and `last_error` fields.
+- Each processed job receives `started_at`, `finished_at`, `message`, `attempts`, and `last_error` fields.
+- `attempts` increments once when a pending job is processed. Failed jobs are not retried automatically yet.

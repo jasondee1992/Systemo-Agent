@@ -34,5 +34,27 @@
     "started_at": "2026-06-16T12:41:27.763931+00:00",
     "finished_at": "2026-06-16T12:41:42.294614+00:00",
     "last_error": null
+  },
+  {
+    "id": "job-20260617001036-3d6ed163",
+    "app": "vlc",
+    "action": "install",
+    "status": "failed",
+    "attempts": 0,
+    "message": null,
+    "started_at": "2026-06-17T00:10:38.259847+00:00",
+    "finished_at": "2026-06-17T00:10:38.260987+00:00",
+    "last_error": "No approved command found for app 'vlc' and action 'install'"
+  },
+  {
+    "id": "job-20260617001417-e04b393e",
+    "app": "vlc",
+    "action": "install",
+    "status": "skipped",
+    "attempts": 1,
+    "message": "Application is already installed",
+    "started_at": "2026-06-17T00:14:20.207244+00:00",
+    "finished_at": "2026-06-17T00:14:25.250363+00:00",
+    "last_error": null
   }
 ]

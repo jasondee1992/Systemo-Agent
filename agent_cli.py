@@ -55,6 +55,8 @@ def add_job(app):
         "app": app,
         "action": ALLOWED_ACTION,
         "status": "pending",
+        "attempts": 0,
+        "message": None,
     }
     jobs.append(job)
     save_jobs(jobs)
@@ -76,16 +78,16 @@ def print_status():
         app = job.get("app", "<missing app>")
         action = job.get("action", "<missing action>")
         status = job.get("status", "<missing status>")
-        started_at = job.get("started_at") or "-"
-        finished_at = job.get("finished_at") or "-"
+        attempts = job.get("attempts", 0)
+        message = job.get("message") or "-"
         last_error = job.get("last_error") or "-"
 
         print(f"- {job_id}")
         print(f"  app: {app}")
         print(f"  action: {action}")
         print(f"  status: {status}")
-        print(f"  started_at: {started_at}")
-        print(f"  finished_at: {finished_at}")
+        print(f"  attempts: {attempts}")
+        print(f"  message: {message}")
         print(f"  last_error: {last_error}")
 
 

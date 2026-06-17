@@ -79,23 +79,90 @@ def get_job_label(job):
     return job.get("id", "<missing id>")
 
 
+def get_next_attempt_count(job):
+    try:
+        return int(job.get("attempts") or 0) + 1
+    except (TypeError, ValueError):
+        return 1
+
+
 def get_catalog_command(catalog, app, action):
+    if action != "install":
+        return None
+
     app_entry = catalog.get(app)
     if not isinstance(app_entry, dict):
         return None
 
-    actions = app_entry.get("actions", {})
-    if not isinstance(actions, dict):
+    winget_id = app_entry.get("winget_id")
+    install_args = app_entry.get("install_args", [])
+    if not isinstance(winget_id, str) or not winget_id:
         return None
 
-    command = actions.get(action)
-    if not isinstance(command, list) or not all(isinstance(arg, str) for arg in command):
+    if not isinstance(install_args, list) or not all(
+        isinstance(arg, str) for arg in install_args
+    ):
         return None
 
-    if not command or Path(command[0]).name.lower() not in {"winget", "winget.exe"}:
+    return ["winget", "install", "--id", winget_id, *install_args]
+
+
+def get_detection_command(catalog, app):
+    app_entry = catalog.get(app)
+    if not isinstance(app_entry, dict):
         return None
 
-    return command
+    detection_method = app_entry.get("detection_method")
+    detection_id = app_entry.get("detection_id")
+    if detection_method != "winget":
+        return None
+
+    if not isinstance(detection_id, str) or not detection_id:
+        return None
+
+    return [
+        "winget",
+        "list",
+        "--id",
+        detection_id,
+        "--accept-source-agreements",
+    ]
+
+
+def is_app_installed(app_key):
+    setup_logging()
+    catalog = load_catalog()
+    command = get_detection_command(catalog, app_key)
+    if command is None:
+        LOGGER.warning("Detection failed for %s: no approved detection command", app_key)
+        return False
+
+    detection_id = catalog[app_key]["detection_id"]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            shell=False,
+            check=False,
+        )
+    except Exception:
+        LOGGER.exception("Detection failed for %s", app_key)
+        return False
+
+    output = "\n".join(
+        part.strip()
+        for part in [completed.stdout, completed.stderr]
+        if part and part.strip()
+    )
+    installed = detection_id.lower() in output.lower()
+
+    if installed:
+        LOGGER.info("Detection result for %s: installed", app_key)
+    else:
+        LOGGER.info("Detection result for %s: not installed", app_key)
+
+    return installed
 
 
 def validate_job(job, catalog):
@@ -113,6 +180,10 @@ def validate_job(job, catalog):
     command = get_catalog_command(catalog, app, action)
     if command is None:
         return f"No approved command found for app '{app}' and action '{action}'"
+
+    detection_command = get_detection_command(catalog, app)
+    if detection_command is None:
+        return f"No approved detection command found for app '{app}'"
 
     return None
 
@@ -166,22 +237,38 @@ def _process_job(job, jobs, catalog):
 
     app = job.get("app")
     action = job.get("action")
+    job["attempts"] = get_next_attempt_count(job)
+    job["started_at"] = utc_now()
+    job["finished_at"] = None
+    job["last_error"] = None
+    job["message"] = "Processing job"
+    save_jobs(jobs)
 
     validation_error = validate_job(job, catalog)
     if validation_error:
         job["status"] = "failed"
-        job["started_at"] = job.get("started_at") or utc_now()
         job["finished_at"] = utc_now()
         job["last_error"] = validation_error
+        job["message"] = validation_error
         save_jobs(jobs)
         LOGGER.warning("Job %s failed validation: %s", job_id, validation_error)
         return
 
     command = get_catalog_command(catalog, app, action)
+
+    if is_app_installed(app):
+        job["status"] = "skipped"
+        job["message"] = "Application is already installed"
+        job["last_error"] = None
+        job["finished_at"] = utc_now()
+        save_jobs(jobs)
+        LOGGER.info("Job %s skipped: %s is already installed", job_id, app)
+        return
+
     job["status"] = "installing"
-    job["started_at"] = utc_now()
     job["finished_at"] = None
     job["last_error"] = None
+    job["message"] = "Installing application"
     save_jobs(jobs)
     LOGGER.info("Job %s started: %s %s", job_id, action, app)
 
@@ -189,10 +276,12 @@ def _process_job(job, jobs, catalog):
         run_install(command)
         job["status"] = "success"
         job["last_error"] = None
+        job["message"] = "Application installed successfully"
         LOGGER.info("Job %s succeeded", job_id)
     except Exception as error:
         job["status"] = "failed"
         job["last_error"] = str(error)
+        job["message"] = "Application installation failed"
         LOGGER.exception("Job %s failed", job_id)
     finally:
         job["finished_at"] = utc_now()

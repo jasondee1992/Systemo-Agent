@@ -1,30 +1,24 @@
 {
   "vlc": {
-    "name": "VLC media player",
-    "actions": {
-      "install": [
-        "winget",
-        "install",
-        "--id",
-        "VideoLAN.VLC",
-        "--silent",
-        "--accept-package-agreements",
-        "--accept-source-agreements"
-      ]
-    }
+    "display_name": "VLC media player",
+    "winget_id": "VideoLAN.VLC",
+    "install_args": [
+      "--silent",
+      "--accept-package-agreements",
+      "--accept-source-agreements"
+    ],
+    "detection_method": "winget",
+    "detection_id": "VideoLAN.VLC"
   },
   "chrome": {
-    "name": "Google Chrome",
-    "actions": {
-      "install": [
-        "winget",
-        "install",
-        "--id",
-        "Google.Chrome",
-        "--silent",
-        "--accept-package-agreements",
-        "--accept-source-agreements"
-      ]
-    }
+    "display_name": "Google Chrome",
+    "winget_id": "Google.Chrome",
+    "install_args": [
+      "--silent",
+      "--accept-package-agreements",
+      "--accept-source-agreements"
+    ],
+    "detection_method": "winget",
+    "detection_id": "Google.Chrome"
   }
 }
