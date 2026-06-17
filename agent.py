@@ -45,8 +45,12 @@ def setup_logging():
         )
         LOGGER.addHandler(file_handler)
 
-    LOGGER.setLevel(logging.INFO)
+    LOGGER.setLevel(logging.DEBUG if is_debug_enabled() else logging.INFO)
     LOGGER.propagate = False
+
+
+def is_debug_enabled():
+    return os.environ.get("SYSTEMO_AGENT_DEBUG", "").lower() in {"1", "true", "yes", "on"}
 
 
 def write_log(message):
@@ -118,9 +122,15 @@ def load_or_create_agent_config():
     return config
 
 
-def build_agent_state(config, last_loop_started_at=None, last_loop_finished_at=None, last_error=None):
+def build_agent_state(
+    config,
+    status="running",
+    last_loop_started_at=None,
+    last_loop_finished_at=None,
+    last_error=None,
+):
     return {
-        "status": "running",
+        "status": status,
         "last_heartbeat_at": utc_now(),
         "device_id": config.get("device_id"),
         "hostname": config.get("hostname"),
@@ -132,17 +142,25 @@ def build_agent_state(config, last_loop_started_at=None, last_loop_finished_at=N
     }
 
 
-def write_agent_state(config, last_loop_started_at=None, last_loop_finished_at=None, last_error=None):
+def write_agent_state(
+    config,
+    status="running",
+    last_loop_started_at=None,
+    last_loop_finished_at=None,
+    last_error=None,
+):
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    save_json(
-        AGENT_STATE_FILE,
-        build_agent_state(
-            config,
-            last_loop_started_at=last_loop_started_at,
-            last_loop_finished_at=last_loop_finished_at,
-            last_error=last_error,
-        ),
+    state = build_agent_state(
+        config,
+        status=status,
+        last_loop_started_at=last_loop_started_at,
+        last_loop_finished_at=last_loop_finished_at,
+        last_error=last_error,
     )
+    save_json(AGENT_STATE_FILE, state)
+
+    if is_debug_enabled():
+        LOGGER.debug("Heartbeat updated: %s", state["last_heartbeat_at"])
 
 
 def load_catalog():
@@ -391,13 +409,13 @@ def run_agent_loop(stop_event=None):
         config.get("agent_version"),
     )
     write_log("Systemo Agent started")
-    write_agent_state(config)
+    write_log("Heartbeat enabled")
 
     while stop_event is None or not stop_event.is_set():
         loop_started_at = utc_now()
-        last_error = None
         write_agent_state(
             config,
+            status="running",
             last_loop_started_at=loop_started_at,
             last_loop_finished_at=None,
             last_error=None,
@@ -405,21 +423,23 @@ def run_agent_loop(stop_event=None):
 
         try:
             process_pending_jobs()
-        except Exception as error:
-            last_error = str(error)
+        except Exception:
+            error_traceback = traceback.format_exc()
             LOGGER.exception("Agent loop failed")
             write_agent_state(
                 config,
+                status="running",
                 last_loop_started_at=loop_started_at,
                 last_loop_finished_at=utc_now(),
-                last_error=traceback.format_exc(),
+                last_error=error_traceback,
             )
         else:
             write_agent_state(
                 config,
+                status="running",
                 last_loop_started_at=loop_started_at,
                 last_loop_finished_at=utc_now(),
-                last_error=last_error,
+                last_error=None,
             )
 
         if stop_event is None:

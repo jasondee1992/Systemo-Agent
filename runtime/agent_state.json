@@ -1,11 +1,11 @@
 {
   "status": "running",
-  "last_heartbeat_at": "2026-06-17T02:11:10.091024+00:00",
+  "last_heartbeat_at": "2026-06-17T03:29:01.148160+00:00",
   "device_id": "778e994a-7683-462b-b101-e49cba48d4c7",
   "hostname": "UDOT",
   "agent_version": "0.3.0",
-  "current_pid": 59964,
-  "last_loop_started_at": "2026-06-17T02:11:10.084703+00:00",
-  "last_loop_finished_at": "2026-06-17T02:11:10.088930+00:00",
+  "current_pid": 64800,
+  "last_loop_started_at": "2026-06-17T03:29:01.143177+00:00",
+  "last_loop_finished_at": "2026-06-17T03:29:01.147164+00:00",
   "last_error": null
 }
