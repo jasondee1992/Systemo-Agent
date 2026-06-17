@@ -70,6 +70,36 @@ Check job status:
 python .\agent_cli.py status
 ```
 
+List all jobs newest first:
+
+```powershell
+python .\agent_cli.py list-jobs
+```
+
+Show one job:
+
+```powershell
+python .\agent_cli.py show-job <job_id>
+```
+
+Clear completed jobs:
+
+```powershell
+python .\agent_cli.py clear-completed
+```
+
+Clear failed jobs:
+
+```powershell
+python .\agent_cli.py clear-failed
+```
+
+Retry a failed job:
+
+```powershell
+python .\agent_cli.py retry-job <job_id>
+```
+
 View agent logs:
 
 ```powershell
@@ -98,6 +128,18 @@ python .\agent_cli.py status
 ```
 
 The second VLC job should become `skipped` with the message `Application is already installed`.
+
+Job management examples:
+
+```powershell
+python .\agent_cli.py add-job vlc
+python .\agent_cli.py list-jobs
+python .\agent_cli.py show-job job-20260617010101-abcd1234
+python .\agent_cli.py clear-completed
+python .\agent_cli.py retry-job job-20260617010101-abcd1234
+```
+
+`clear-completed` removes only `success` and `skipped` jobs. `clear-failed` removes only `failed` jobs. `retry-job` only works for failed jobs and sets the same job back to `pending`; it does not create a duplicate job.
 
 ## Uninstall Systemo Agent
 
