@@ -11,6 +11,9 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
+from database import init_database, session_scope
+from models import AppRequest, AuditLog, Company, Device, Job, User
+
 
 BASE_DIR = Path(__file__).resolve().parent
 BACKEND_DIR = BASE_DIR / "mock_backend"
@@ -29,6 +32,7 @@ APP_REQUEST_STATUSES = {"pending", "approved", "rejected", "converted_to_job"}
 SESSION_COOKIE_NAME = "systemo_session"
 SESSIONS = {}
 
+init_database()
 app = FastAPI(title="Systemo Agent Mock Backend")
 
 
@@ -114,76 +118,195 @@ def load_catalog():
     return catalog
 
 
+def get_default_company_for_legacy_data():
+    with session_scope() as session:
+        company = session.query(Company).order_by(Company.created_at.asc()).first()
+        if company is None:
+            return None, None
+        return company.company_id, company.company_name
+
+
 def load_jobs():
-    BACKEND_DIR.mkdir(parents=True, exist_ok=True)
-    if not JOBS_FILE.exists():
-        save_jobs([])
-        return []
-
-    with JOBS_FILE.open("r", encoding="utf-8") as file:
-        jobs = json.load(file)
-
-    if not isinstance(jobs, list):
-        raise HTTPException(status_code=500, detail="mock_backend/jobs.json must contain an array")
-
-    return jobs
+    with session_scope() as session:
+        return [
+            job.to_dict()
+            for job in session.query(Job).order_by(Job.created_at.asc()).all()
+        ]
 
 
 def save_jobs(jobs):
-    BACKEND_DIR.mkdir(parents=True, exist_ok=True)
-    temp_file = JOBS_FILE.with_suffix(".json.tmp")
-    with temp_file.open("w", encoding="utf-8") as file:
-        json.dump(jobs, file, indent=2)
-        file.write("\n")
-    temp_file.replace(JOBS_FILE)
+    if not isinstance(jobs, list):
+        raise HTTPException(status_code=500, detail="jobs must contain an array")
+
+    now = utc_now()
+    incoming_ids = {
+        job.get("id") or job.get("job_id")
+        for job in jobs
+        if isinstance(job, dict) and (job.get("id") or job.get("job_id"))
+    }
+    fallback_company_id, fallback_company_name = get_default_company_for_legacy_data()
+    with session_scope() as session:
+        for existing_job in session.query(Job).all():
+            if existing_job.job_id not in incoming_ids:
+                session.delete(existing_job)
+
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            job_id = job.get("id") or job.get("job_id")
+            if not job_id:
+                continue
+            company_id = job.get("company_id") or fallback_company_id
+            company_name = job.get("company_name") or fallback_company_name
+            if not company_id or not company_name:
+                continue
+            row = session.get(Job, job_id)
+            if row is None:
+                row = Job(
+                    job_id=job_id,
+                    company_id=company_id,
+                    company_name=company_name,
+                    device_id=job.get("device_id") or "any",
+                    app=job.get("app"),
+                    action=job.get("action"),
+                    status=job.get("status") or "approved",
+                    created_at=job.get("created_at") or now,
+                    updated_at=job.get("updated_at") or now,
+                )
+                session.add(row)
+
+            row.company_id = company_id
+            row.company_name = company_name
+            row.device_id = job.get("device_id") or "any"
+            row.app = job.get("app")
+            row.action = job.get("action")
+            row.status = job.get("status") or row.status
+            row.attempts = int(job.get("attempts") or 0)
+            row.message = job.get("message")
+            row.last_error = job.get("last_error")
+            row.created_by_user_id = job.get("created_by_user_id")
+            row.created_by_username = job.get("created_by_username")
+            row.approved_by_user_id = job.get("approved_by_user_id")
+            row.approved_by_username = job.get("approved_by_username")
+            row.request_id = job.get("request_id") or job.get("source_request_id")
+            row.started_at = job.get("started_at")
+            row.finished_at = job.get("finished_at")
+            row.audit_started_at = job.get("audit_started_at")
+            row.audit_result_status = job.get("audit_result_status")
+            row.created_at = job.get("created_at") or row.created_at or now
+            row.updated_at = now
 
 
 def load_app_requests():
-    BACKEND_DIR.mkdir(parents=True, exist_ok=True)
-    if not APP_REQUESTS_FILE.exists():
-        save_app_requests([])
-        return []
-
-    with APP_REQUESTS_FILE.open("r", encoding="utf-8") as file:
-        app_requests = json.load(file)
-
-    if not isinstance(app_requests, list):
-        raise HTTPException(status_code=500, detail="mock_backend/app_requests.json must contain an array")
-
-    return app_requests
+    with session_scope() as session:
+        return [
+            app_request.to_dict()
+            for app_request in session.query(AppRequest).order_by(AppRequest.created_at.asc()).all()
+        ]
 
 
 def save_app_requests(app_requests):
-    BACKEND_DIR.mkdir(parents=True, exist_ok=True)
-    temp_file = APP_REQUESTS_FILE.with_suffix(".json.tmp")
-    with temp_file.open("w", encoding="utf-8") as file:
-        json.dump(app_requests, file, indent=2)
-        file.write("\n")
-    temp_file.replace(APP_REQUESTS_FILE)
+    if not isinstance(app_requests, list):
+        raise HTTPException(status_code=500, detail="app_requests must contain an array")
+
+    now = utc_now()
+    incoming_ids = {
+        app_request.get("request_id")
+        for app_request in app_requests
+        if isinstance(app_request, dict) and app_request.get("request_id")
+    }
+    with session_scope() as session:
+        for existing_request in session.query(AppRequest).all():
+            if existing_request.request_id not in incoming_ids:
+                session.delete(existing_request)
+
+        for app_request in app_requests:
+            if not isinstance(app_request, dict) or not app_request.get("request_id"):
+                continue
+            row = session.get(AppRequest, app_request.get("request_id"))
+            if row is None:
+                row = AppRequest(
+                    request_id=app_request.get("request_id"),
+                    company_id=app_request.get("company_id"),
+                    company_name=app_request.get("company_name"),
+                    target_type=app_request.get("target_type"),
+                    app=app_request.get("app"),
+                    action=app_request.get("action"),
+                    status=app_request.get("status"),
+                    created_at=app_request.get("created_at") or now,
+                    updated_at=app_request.get("updated_at") or now,
+                )
+                session.add(row)
+
+            row.company_id = app_request.get("company_id")
+            row.company_name = app_request.get("company_name")
+            row.device_id = app_request.get("device_id")
+            row.target_device_id = app_request.get("target_device_id") or "any"
+            row.target_type = app_request.get("target_type")
+            row.app = app_request.get("app")
+            row.action = app_request.get("action")
+            row.requested_by_user_id = app_request.get("requested_by_user_id")
+            row.requested_by_username = app_request.get("requested_by_username")
+            row.status = app_request.get("status")
+            row.approved_by_user_id = app_request.get("approved_by_user_id")
+            row.approved_by_username = app_request.get("approved_by_username")
+            row.rejected_by_user_id = app_request.get("rejected_by_user_id")
+            row.rejected_by_username = app_request.get("rejected_by_username")
+            row.linked_job_id = app_request.get("linked_job_id")
+            row.reason = app_request.get("reason")
+            row.created_at = app_request.get("created_at") or row.created_at or now
+            row.updated_at = app_request.get("updated_at") or now
 
 
 def load_audit_logs():
-    BACKEND_DIR.mkdir(parents=True, exist_ok=True)
-    if not AUDIT_LOGS_FILE.exists():
-        save_audit_logs([])
-        return []
-
-    with AUDIT_LOGS_FILE.open("r", encoding="utf-8") as file:
-        audit_logs = json.load(file)
-
-    if not isinstance(audit_logs, list):
-        raise HTTPException(status_code=500, detail="mock_backend/audit_logs.json must contain an array")
-
-    return audit_logs
+    with session_scope() as session:
+        return [
+            audit_log.to_dict()
+            for audit_log in session.query(AuditLog).order_by(AuditLog.created_at.asc()).all()
+        ]
 
 
 def save_audit_logs(audit_logs):
-    BACKEND_DIR.mkdir(parents=True, exist_ok=True)
-    temp_file = AUDIT_LOGS_FILE.with_suffix(".json.tmp")
-    with temp_file.open("w", encoding="utf-8") as file:
-        json.dump(audit_logs, file, indent=2)
-        file.write("\n")
-    temp_file.replace(AUDIT_LOGS_FILE)
+    if not isinstance(audit_logs, list):
+        raise HTTPException(status_code=500, detail="audit_logs must contain an array")
+
+    incoming_ids = {
+        audit_log.get("audit_id")
+        for audit_log in audit_logs
+        if isinstance(audit_log, dict) and audit_log.get("audit_id")
+    }
+    with session_scope() as session:
+        for existing_log in session.query(AuditLog).all():
+            if existing_log.audit_id not in incoming_ids:
+                session.delete(existing_log)
+
+        for audit_log in audit_logs:
+            if not isinstance(audit_log, dict) or not audit_log.get("audit_id"):
+                continue
+            row = session.get(AuditLog, audit_log.get("audit_id"))
+            if row is None:
+                row = AuditLog(
+                    audit_id=audit_log.get("audit_id"),
+                    event_type=audit_log.get("event_type"),
+                    message=audit_log.get("message") or "",
+                    created_at=audit_log.get("created_at") or utc_now(),
+                )
+                session.add(row)
+
+            row.event_type = audit_log.get("event_type")
+            row.company_id = audit_log.get("company_id")
+            row.company_name = audit_log.get("company_name")
+            row.actor_user_id = audit_log.get("actor_user_id")
+            row.actor_username = audit_log.get("actor_username")
+            row.actor_role = audit_log.get("actor_role")
+            row.device_id = audit_log.get("device_id")
+            row.request_id = audit_log.get("request_id")
+            row.job_id = audit_log.get("job_id")
+            row.target_type = audit_log.get("target_type")
+            row.target_label = audit_log.get("target_label")
+            row.message = audit_log.get("message") or ""
+            row.metadata_json = json.dumps(audit_log.get("metadata") or {})
+            row.created_at = audit_log.get("created_at") or row.created_at or utc_now()
 
 
 def log_audit(
@@ -224,40 +347,68 @@ def log_audit(
 
 
 def load_devices():
-    BACKEND_DIR.mkdir(parents=True, exist_ok=True)
-    if not DEVICES_FILE.exists():
-        save_devices([])
-        return []
-
-    with DEVICES_FILE.open("r", encoding="utf-8") as file:
-        devices = json.load(file)
-
-    if not isinstance(devices, list):
-        raise HTTPException(status_code=500, detail="mock_backend/devices.json must contain an array")
-
-    return devices
+    with session_scope() as session:
+        return [
+            device.to_dict()
+            for device in session.query(Device).order_by(Device.last_seen_at.desc()).all()
+        ]
 
 
 def save_devices(devices):
-    BACKEND_DIR.mkdir(parents=True, exist_ok=True)
-    temp_file = DEVICES_FILE.with_suffix(".json.tmp")
-    with temp_file.open("w", encoding="utf-8") as file:
-        json.dump(devices, file, indent=2)
-        file.write("\n")
-    temp_file.replace(DEVICES_FILE)
+    if not isinstance(devices, list):
+        raise HTTPException(status_code=500, detail="devices must contain an array")
+
+    now = utc_now()
+    incoming_ids = {
+        device.get("device_id")
+        for device in devices
+        if isinstance(device, dict) and device.get("device_id")
+    }
+    fallback_company_id, fallback_company_name = get_default_company_for_legacy_data()
+    with session_scope() as session:
+        for existing_device in session.query(Device).all():
+            if existing_device.device_id not in incoming_ids:
+                session.delete(existing_device)
+
+        for device in devices:
+            if not isinstance(device, dict) or not device.get("device_id"):
+                continue
+            company_id = device.get("company_id") or fallback_company_id
+            company_name = device.get("company_name") or fallback_company_name
+            if not company_id or not company_name:
+                continue
+            row = session.get(Device, device.get("device_id"))
+            if row is None:
+                row = Device(
+                    device_id=device.get("device_id"),
+                    company_id=company_id,
+                    company_name=company_name,
+                    created_at=device.get("created_at") or now,
+                    updated_at=device.get("updated_at") or now,
+                )
+                session.add(row)
+
+            row.company_id = company_id
+            row.company_name = company_name
+            row.hostname = device.get("hostname")
+            row.username = device.get("username")
+            row.os = device.get("os")
+            row.agent_name = device.get("agent_name")
+            row.agent_version = device.get("agent_version")
+            row.approval_status = device.get("approval_status") or "pending_approval"
+            row.connection_status = device.get("connection_status") or device.get("status") or "online"
+            row.status = device.get("status") or row.connection_status
+            row.last_seen_at = device.get("last_seen_at")
+            row.created_at = device.get("created_at") or row.created_at or now
+            row.updated_at = now
 
 
 def load_tenants():
-    BACKEND_DIR.mkdir(parents=True, exist_ok=True)
-    if not TENANTS_FILE.exists():
-        save_tenants([])
-        return []
-
-    with TENANTS_FILE.open("r", encoding="utf-8") as file:
-        tenants = json.load(file)
-
-    if not isinstance(tenants, list):
-        raise HTTPException(status_code=500, detail="mock_backend/tenants.json must contain an array")
+    with session_scope() as session:
+        tenants = [
+            company.to_dict()
+            for company in session.query(Company).order_by(Company.created_at.asc()).all()
+        ]
 
     for tenant in tenants:
         ensure_company_fields(tenant)
@@ -266,12 +417,43 @@ def load_tenants():
 
 
 def save_tenants(tenants):
-    BACKEND_DIR.mkdir(parents=True, exist_ok=True)
-    temp_file = TENANTS_FILE.with_suffix(".json.tmp")
-    with temp_file.open("w", encoding="utf-8") as file:
-        json.dump(tenants, file, indent=2)
-        file.write("\n")
-    temp_file.replace(TENANTS_FILE)
+    if not isinstance(tenants, list):
+        raise HTTPException(status_code=500, detail="tenants must contain an array")
+
+    now = utc_now()
+    incoming_ids = {
+        (tenant.get("company_id") or tenant.get("tenant_id"))
+        for tenant in tenants
+        if isinstance(tenant, dict) and (tenant.get("company_id") or tenant.get("tenant_id"))
+    }
+    with session_scope() as session:
+        for existing_company in session.query(Company).all():
+            if existing_company.company_id not in incoming_ids:
+                session.delete(existing_company)
+
+        for tenant in tenants:
+            if not isinstance(tenant, dict):
+                continue
+            ensure_company_fields(tenant)
+            company_id = tenant.get("company_id") or tenant.get("tenant_id")
+            if not company_id:
+                continue
+            row = session.get(Company, company_id)
+            if row is None:
+                row = Company(
+                    company_id=company_id,
+                    company_name=tenant.get("company_name"),
+                    slug=tenant.get("slug") or company_id,
+                    created_at=tenant.get("created_at") or now,
+                    updated_at=tenant.get("updated_at") or now,
+                )
+                session.add(row)
+
+            row.company_name = tenant.get("company_name")
+            row.slug = tenant.get("slug") or company_id
+            row.status = tenant.get("status") or "active"
+            row.created_at = tenant.get("created_at") or row.created_at or now
+            row.updated_at = tenant.get("updated_at") or now
 
 
 def normalize_company_name(company_name):
@@ -360,12 +542,41 @@ def hash_password(password):
 
 
 def save_users(users):
-    BACKEND_DIR.mkdir(parents=True, exist_ok=True)
-    temp_file = USERS_FILE.with_suffix(".json.tmp")
-    with temp_file.open("w", encoding="utf-8") as file:
-        json.dump(users, file, indent=2)
-        file.write("\n")
-    temp_file.replace(USERS_FILE)
+    if not isinstance(users, list):
+        raise HTTPException(status_code=500, detail="users must contain an array")
+
+    now = utc_now()
+    incoming_ids = {
+        user.get("user_id")
+        for user in users
+        if isinstance(user, dict) and user.get("user_id")
+    }
+    with session_scope() as session:
+        for existing_user in session.query(User).all():
+            if existing_user.user_id not in incoming_ids:
+                session.delete(existing_user)
+
+        for user in users:
+            if not isinstance(user, dict) or not user.get("user_id"):
+                continue
+            row = session.get(User, user.get("user_id"))
+            if row is None:
+                row = User(
+                    user_id=user.get("user_id"),
+                    username=user.get("username"),
+                    password_hash=user.get("password_hash"),
+                    role=user.get("role"),
+                    created_at=user.get("created_at") or now,
+                    updated_at=user.get("updated_at") or now,
+                )
+                session.add(row)
+
+            row.username = user.get("username")
+            row.password_hash = user.get("password_hash")
+            row.role = user.get("role")
+            row.company_id = user.get("company_id")
+            row.created_at = user.get("created_at") or row.created_at or now
+            row.updated_at = user.get("updated_at") or now
 
 
 def seed_default_users():
@@ -405,17 +616,56 @@ def seed_default_users():
 
 
 def load_users():
-    BACKEND_DIR.mkdir(parents=True, exist_ok=True)
-    if not USERS_FILE.exists():
+    with session_scope() as session:
+        users = [user.to_dict() for user in session.query(User).order_by(User.created_at.asc()).all()]
+
+    if not users:
         return seed_default_users()
 
-    with USERS_FILE.open("r", encoding="utf-8") as file:
-        users = json.load(file)
-
-    if not isinstance(users, list):
-        raise HTTPException(status_code=500, detail="mock_backend/users.json must contain an array")
-
     return users
+
+
+def safe_load_json_array(path):
+    if not path.exists():
+        return None
+
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            value = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    return value if isinstance(value, list) else None
+
+
+def table_has_records(model):
+    with session_scope() as session:
+        return session.query(model).first() is not None
+
+
+def migrate_existing_json_data():
+    migrations = [
+        (TENANTS_FILE, Company, save_tenants),
+        (USERS_FILE, User, save_users),
+        (DEVICES_FILE, Device, save_devices),
+        (APP_REQUESTS_FILE, AppRequest, save_app_requests),
+        (JOBS_FILE, Job, save_jobs),
+        (AUDIT_LOGS_FILE, AuditLog, save_audit_logs),
+    ]
+    for path, model, save_function in migrations:
+        if table_has_records(model):
+            continue
+        records = safe_load_json_array(path)
+        if records:
+            save_function(records)
+
+
+def initialize_persistent_data():
+    migrate_existing_json_data()
+    load_users()
+
+
+initialize_persistent_data()
 
 
 def public_user(user):

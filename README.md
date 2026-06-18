@@ -683,6 +683,84 @@ To verify role scoping, create or use another company/device, then compare the A
 - `ybalai_admin` should see only `Ybalai Builders` audit logs.
 - `ybalai_viewer` should see only `Ybalai Builders` audit logs and has read-only access.
 
+## Phase 11 SQLite Persistence
+
+The mock backend now stores companies, users, devices, app requests, jobs, and audit logs in SQLite using SQLAlchemy.
+
+Database file:
+
+```text
+runtime/systemo.db
+```
+
+Start the mock server:
+
+```powershell
+python .\mock_server.py
+```
+
+On first run, the server creates missing tables and seeds prototype users without duplicating records on restart:
+
+- `admin` / `admin123` / `system_admin`
+- `ybalai_admin` / `admin123` / `company_admin`
+- `ybalai_viewer` / `admin123` / `viewer`
+
+If old JSON files exist in `mock_backend`, the server imports them into SQLite only when the matching table is empty. Existing databases are not deleted automatically.
+
+To test persistence:
+
+```powershell
+python .\mock_server.py
+```
+
+In another PowerShell:
+
+```powershell
+python .\agent_cli.py enroll-device --company "Ybalai Builders"
+python .\agent_cli.py set-mode api
+Stop-ScheduledTask -TaskName "Systemo Agent"
+Start-ScheduledTask -TaskName "Systemo Agent"
+```
+
+Open the dashboard:
+
+```text
+http://127.0.0.1:8008
+```
+
+Then:
+
+1. Login as `admin / admin123`.
+2. Approve the pending device.
+3. Login as `ybalai_viewer / admin123`.
+4. Create a `7zip install` app request.
+5. Login as `ybalai_admin / admin123`.
+6. Approve the request.
+7. Confirm the agent executes the job:
+
+```powershell
+Start-Sleep -Seconds 45
+python .\agent_cli.py api-list-jobs
+python .\agent_cli.py detect 7zip
+```
+
+Check audit logs in the dashboard. Stop `mock_server.py`, start it again, and verify companies, users, devices, requests, jobs, and audit logs are still present.
+
+Confirm the direct prototype job path still works:
+
+```powershell
+python .\agent_cli.py api-add-job 7zip install
+python .\agent_cli.py api-list-jobs
+```
+
+For local development only, reset the SQLite database by stopping `mock_server.py` and deleting:
+
+```powershell
+Remove-Item .\runtime\systemo.db
+```
+
+Do not delete the database on a client machine unless you intentionally want to reset all mock backend data.
+
 To test VLC detection after uninstall:
 
 ```powershell
