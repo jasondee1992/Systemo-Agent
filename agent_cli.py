@@ -1,7 +1,9 @@
 import argparse
 import json
 import re
+import subprocess
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +23,9 @@ BASE_DIR = Path(__file__).resolve().parent
 CATALOG_FILE = BASE_DIR / "app_catalog.json"
 JOBS_FILE = BASE_DIR / "jobs.json"
 AGENT_LOG_FILE = BASE_DIR / "logs" / "agent.log"
+INSTALL_TASK_SCRIPT = BASE_DIR / "scripts" / "install_task.ps1"
+UNINSTALL_TASK_SCRIPT = BASE_DIR / "scripts" / "uninstall_task.ps1"
+TASK_NAME = "Systemo Agent"
 ALLOWED_ACTIONS = {"install", "uninstall"}
 COMPLETED_STATUSES = {"success", "skipped"}
 FAILED_STATUS = "failed"
@@ -103,12 +108,130 @@ def get_api_base_url(config):
     return str(config.get("api_base_url") or DEFAULT_API_BASE_URL).rstrip("/")
 
 
+def normalize_api_url(api_url):
+    api_url = (api_url or DEFAULT_API_BASE_URL).strip().rstrip("/")
+    if not api_url:
+        raise ValueError("API URL is required")
+    if not re.match(r"^https?://", api_url, re.IGNORECASE):
+        raise ValueError("API URL must start with http:// or https://")
+    return api_url
+
+
 def slugify_company_name(company_name):
     normalized_name = (company_name or "").strip().lower()
     slug = re.sub(r"[^a-z0-9]+", "-", normalized_name).strip("-")
     if not slug:
         raise ValueError("Company name must contain letters or numbers")
     return slug
+
+
+def run_powershell(command, check=True):
+    completed = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+        ],
+        cwd=BASE_DIR,
+        text=True,
+        capture_output=True,
+    )
+    if check and completed.returncode != 0:
+        message = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(message or f"PowerShell command failed with exit code {completed.returncode}")
+    return completed
+
+
+def run_powershell_file(script_path):
+    completed = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script_path),
+        ],
+        cwd=BASE_DIR,
+        text=True,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        message = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(message or f"PowerShell script failed: {script_path}")
+    return completed
+
+
+def get_scheduled_task_status():
+    command = rf"""
+$Task = Get-ScheduledTask -TaskName "{TASK_NAME}" -ErrorAction SilentlyContinue
+if ($null -eq $Task) {{
+    [pscustomobject]@{{ installed = $false; state = "missing"; last_task_result = $null; last_run_time = $null; next_run_time = $null }} | ConvertTo-Json -Compress
+    exit 0
+}}
+$Info = Get-ScheduledTaskInfo -TaskName "{TASK_NAME}" -ErrorAction SilentlyContinue
+[pscustomobject]@{{
+    installed = $true
+    state = [string]$Task.State
+    last_task_result = if ($Info) {{ $Info.LastTaskResult }} else {{ $null }}
+    last_run_time = if ($Info) {{ $Info.LastRunTime }} else {{ $null }}
+    next_run_time = if ($Info) {{ $Info.NextRunTime }} else {{ $null }}
+}} | ConvertTo-Json -Compress
+"""
+    try:
+        completed = run_powershell(command, check=False)
+    except FileNotFoundError:
+        return {"installed": False, "state": "unavailable", "error": "powershell not found"}
+
+    if completed.returncode != 0:
+        return {
+            "installed": False,
+            "state": "unknown",
+            "error": (completed.stderr or completed.stdout or "").strip(),
+        }
+
+    try:
+        status = json.loads(completed.stdout.strip())
+    except json.JSONDecodeError:
+        return {"installed": False, "state": "unknown", "error": completed.stdout.strip()}
+
+    return status if isinstance(status, dict) else {"installed": False, "state": "unknown"}
+
+
+def print_scheduled_task_status(prefix="scheduled_task"):
+    status = get_scheduled_task_status()
+    print(f"{prefix}_installed: {str(bool(status.get('installed'))).lower()}")
+    print(f"{prefix}_state: {status.get('state') or '-'}")
+    print(f"{prefix}_last_task_result: {status.get('last_task_result') if status.get('last_task_result') is not None else '-'}")
+    print(f"{prefix}_last_run_time: {status.get('last_run_time') or '-'}")
+    if status.get("error"):
+        print(f"{prefix}_error: {status.get('error')}")
+
+
+def stop_scheduled_task_if_exists():
+    run_powershell(
+        f'Stop-ScheduledTask -TaskName "{TASK_NAME}" -ErrorAction SilentlyContinue',
+        check=False,
+    )
+
+
+def start_scheduled_task():
+    run_powershell(f'Start-ScheduledTask -TaskName "{TASK_NAME}"')
+
+
+def install_or_update_scheduled_task():
+    if not INSTALL_TASK_SCRIPT.exists():
+        raise ValueError(f"Missing scheduled task installer: {INSTALL_TASK_SCRIPT}")
+    return run_powershell_file(INSTALL_TASK_SCRIPT)
+
+
+def uninstall_scheduled_task():
+    if not UNINSTALL_TASK_SCRIPT.exists():
+        raise ValueError(f"Missing scheduled task uninstaller: {UNINSTALL_TASK_SCRIPT}")
+    return run_powershell_file(UNINSTALL_TASK_SCRIPT)
 
 
 def register_company(company_name):
@@ -121,6 +244,147 @@ def register_company(company_name):
     config["company_id"] = slugify_company_name(normalized_name)
     save_json(CONFIG_FILE, config)
     print(f"Registered company {config['company_name']} ({config['company_id']}).")
+
+
+def save_agent_api_config(company_name, api_url):
+    normalized_company_name = (company_name or "").strip()
+    if not normalized_company_name:
+        raise ValueError("Company name is required")
+
+    config = load_or_create_agent_config()
+    config["job_source"] = "api"
+    config["api_base_url"] = normalize_api_url(api_url)
+    config["company_name"] = normalized_company_name
+    config["company_id"] = slugify_company_name(normalized_company_name)
+    save_json(CONFIG_FILE, config)
+    return config
+
+
+def validate_api_health(api_url):
+    requests = get_requests_module()
+    response = requests.get(f"{normalize_api_url(api_url)}/health", timeout=10)
+    response.raise_for_status()
+    health = response.json()
+    if not isinstance(health, dict) or health.get("status") != "ok":
+        raise ValueError(f"API health check did not return status ok: {health}")
+    return health
+
+
+def build_device_check_in_payload(config):
+    return {
+        "device_id": config.get("device_id"),
+        "company_id": config.get("company_id"),
+        "company_name": config.get("company_name"),
+        "hostname": config.get("hostname"),
+        "username": config.get("username"),
+        "os": config.get("os"),
+        "agent_name": config.get("agent_name") or "Systemo Agent",
+        "agent_version": config.get("agent_version") or "0.3.0",
+        "status": "online",
+    }
+
+
+def register_device_with_api(config):
+    requests = get_requests_module()
+    response = requests.post(
+        f"{get_api_base_url(config)}/api/agent/check-in",
+        json=build_device_check_in_payload(config),
+        timeout=10,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def get_current_api_device(config):
+    if not config.get("device_id"):
+        return None
+
+    try:
+        requests = get_requests_module()
+        response = requests.get(
+            f"{get_api_base_url(config)}/api/devices/{config.get('device_id')}",
+            timeout=10,
+        )
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        device = response.json()
+        return device if isinstance(device, dict) else None
+    except Exception:
+        return None
+
+
+def prompt_for_install_value(prompt, default=None):
+    suffix = f" [{default}]" if default else ""
+    value = input(f"{prompt}{suffix}: ").strip()
+    return value or default
+
+
+def wait_for_agent_health(timeout_seconds=20):
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        state = load_json(AGENT_STATE_FILE, {}) if AGENT_STATE_FILE.exists() else {}
+        heartbeat_age = get_heartbeat_age_seconds(state.get("last_heartbeat_at")) if isinstance(state, dict) else None
+        if heartbeat_age is not None and heartbeat_age <= 15:
+            return "healthy"
+        time.sleep(2)
+    return "stale"
+
+
+def install_agent(company_name=None, api_url=None):
+    api_url = normalize_api_url(api_url or prompt_for_install_value("API URL", DEFAULT_API_BASE_URL))
+    company_name = company_name or prompt_for_install_value("Company Name")
+    if not company_name:
+        raise ValueError("Company Name is required")
+
+    print(f"Checking API: {api_url}")
+    validate_api_health(api_url)
+    print("API health: ok")
+
+    config = save_agent_api_config(company_name, api_url)
+    device = register_device_with_api(config)
+    approval_status = device.get("approval_status") if isinstance(device, dict) else None
+    print(f"Device registered: {config.get('device_id')}")
+
+    print("Installing or updating scheduled task...")
+    install_or_update_scheduled_task()
+    stop_scheduled_task_if_exists()
+    start_scheduled_task()
+    agent_status = wait_for_agent_health()
+
+    refreshed_device = get_current_api_device(config) or device or {}
+    print("")
+    print("Systemo Agent install status")
+    print(f"device_id: {config.get('device_id')}")
+    print(f"company_name: {config.get('company_name')}")
+    print(f"company_id: {config.get('company_id')}")
+    print(f"api_base_url: {config.get('api_base_url')}")
+    print(f"approval_status: {refreshed_device.get('approval_status') or approval_status or '-'}")
+    print(f"agent_status: {agent_status}")
+    print_scheduled_task_status()
+    if (refreshed_device.get("approval_status") or approval_status) != "approved":
+        print("next_instruction: wait for an admin to approve this device in the dashboard")
+    else:
+        print("next_instruction: device is approved and ready for API jobs")
+
+
+def uninstall_agent(purge=False):
+    print("Stopping scheduled task if it is running...")
+    stop_scheduled_task_if_exists()
+    print("Removing scheduled task...")
+    uninstall_scheduled_task()
+
+    if purge:
+        if CONFIG_FILE.exists():
+            CONFIG_FILE.unlink()
+            print("Removed config/agent_config.json")
+        if AGENT_STATE_FILE.exists():
+            AGENT_STATE_FILE.unlink()
+            print("Removed runtime/agent_state.json")
+    else:
+        print("Config preserved. Use --purge to remove local config and runtime state.")
+
+    print_scheduled_task_status()
 
 
 def validate_app_action(app, action):
@@ -526,6 +790,8 @@ def print_info():
         "agent_name",
         "agent_version",
         "device_id",
+        "job_source",
+        "api_base_url",
         "company_id",
         "company_name",
         "hostname",
@@ -537,6 +803,10 @@ def print_info():
 
     for field in fields:
         print(f"{field}: {config.get(field) or '-'}")
+
+    device = get_current_api_device(config) if (config.get("job_source") == "api") else None
+    print(f"approval_status: {device.get('approval_status') or '-' if device else '-'}")
+    print_scheduled_task_status()
 
 
 def parse_timestamp(timestamp):
@@ -592,8 +862,11 @@ def print_health():
         print(f"api_base_url: {config.get('api_base_url') or DEFAULT_API_BASE_URL}")
         print(f"company_id: {config.get('company_id') or '-'}")
         print(f"company_name: {config.get('company_name') or '-'}")
+        device = get_current_api_device(config)
+        print(f"approval_status: {device.get('approval_status') or '-' if device else '-'}")
         if not config.get("company_id") and not config.get("company_name"):
             print("company_warning: no company configured; API check-in and jobs are company-scoped")
+    print_scheduled_task_status()
 
 
 def build_parser():
@@ -605,6 +878,13 @@ def build_parser():
     add_job_parser.add_argument("action", nargs="?", default="install", choices=sorted(ALLOWED_ACTIONS))
 
     subparsers.add_parser("mode", help="Print current job source mode")
+
+    install_agent_parser = subparsers.add_parser("install-agent", help="Enroll and install the background agent")
+    install_agent_parser.add_argument("--company", dest="company_name")
+    install_agent_parser.add_argument("--api-url", dest="api_url")
+
+    uninstall_agent_parser = subparsers.add_parser("uninstall-agent", help="Stop and remove the background agent task")
+    uninstall_agent_parser.add_argument("--purge", action="store_true", help="Remove local config and runtime state")
 
     register_company_parser = subparsers.add_parser("register-company", help="Store local company enrollment")
     register_company_parser.add_argument("company_name")
@@ -679,6 +959,10 @@ def main():
             add_job(args.app, args.action)
         elif args.command == "mode":
             print_mode()
+        elif args.command == "install-agent":
+            install_agent(args.company_name, args.api_url)
+        elif args.command == "uninstall-agent":
+            uninstall_agent(args.purge)
         elif args.command == "register-company":
             register_company(args.company_name)
         elif args.command == "enroll-device":

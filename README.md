@@ -761,6 +761,115 @@ Remove-Item .\runtime\systemo.db
 
 Do not delete the database on a client machine unless you intentionally want to reset all mock backend data.
 
+## Phase 12 Agent Installer and Enrollment
+
+The local installer/enrollment command configures the agent for API mode, registers the device with the mock backend, creates or updates the Windows Scheduled Task, starts the task, and prints the device approval state.
+
+Default API URL:
+
+```text
+http://127.0.0.1:8008
+```
+
+Start the mock server first:
+
+```powershell
+python .\mock_server.py
+```
+
+Run PowerShell as Administrator, then install/enroll the agent:
+
+```powershell
+python .\agent_cli.py install-agent --company "Ybalai Builders" --api-url "http://127.0.0.1:8008"
+```
+
+Interactive mode is also supported:
+
+```powershell
+python .\agent_cli.py install-agent
+```
+
+It prompts for:
+
+```text
+API URL [http://127.0.0.1:8008]:
+Company Name:
+```
+
+The installer prints:
+
+- `device_id`
+- `company_name`
+- `company_id`
+- `api_base_url`
+- `approval_status`
+- `agent_status`
+- scheduled task status
+- next instruction
+
+New devices appear in the dashboard as `pending_approval`. Login as an admin and approve the device:
+
+```text
+http://127.0.0.1:8008
+admin / admin123
+```
+
+Check local config and health:
+
+```powershell
+python .\agent_cli.py info
+python .\agent_cli.py health
+```
+
+Both commands show API mode, API URL, company, device ID, approval status when available, and scheduled task status.
+
+After approval, test job execution with an app request from the dashboard or direct prototype CLI job:
+
+```powershell
+python .\agent_cli.py api-add-job 7zip install
+Start-Sleep -Seconds 45
+python .\agent_cli.py api-list-jobs
+python .\agent_cli.py detect 7zip
+```
+
+Then test uninstall:
+
+```powershell
+python .\agent_cli.py api-add-job 7zip uninstall
+Start-Sleep -Seconds 45
+python .\agent_cli.py api-list-jobs
+python .\agent_cli.py detect 7zip
+```
+
+Re-running the installer for the same company updates the config and scheduled task. It does not create duplicate scheduled tasks, and the backend preserves an already approved device status:
+
+```powershell
+python .\agent_cli.py install-agent --company "Ybalai Builders" --api-url "http://127.0.0.1:8008"
+python .\agent_cli.py health
+```
+
+Uninstall/disable the background task:
+
+```powershell
+python .\agent_cli.py uninstall-agent
+```
+
+This stops and removes the scheduled task but keeps local config by default. To remove local config and runtime state:
+
+```powershell
+python .\agent_cli.py uninstall-agent --purge
+```
+
+Prototype security note: Phase 12 still supports manual company-name enrollment. Production enrollment should use a one-time enrollment code or signed token instead of company name alone.
+
+Installer troubleshooting:
+
+- If API validation fails, start `mock_server.py` and confirm `http://127.0.0.1:8008/health` returns `{"status":"ok"}`.
+- If scheduled task installation fails with access denied, run PowerShell as Administrator.
+- If the device is `pending_approval`, approve it in the dashboard before expecting jobs to execute.
+- If health is stale, run `Get-ScheduledTaskInfo -TaskName "Systemo Agent"` and check `logs/task-runner.log` and `logs/agent.log`.
+- If jobs do not execute, confirm `python .\agent_cli.py health` shows API mode, the expected API URL, an approved device, and a running scheduled task.
+
 To test VLC detection after uninstall:
 
 ```powershell
