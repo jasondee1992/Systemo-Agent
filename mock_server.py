@@ -13,9 +13,11 @@ BASE_DIR = Path(__file__).resolve().parent
 BACKEND_DIR = BASE_DIR / "mock_backend"
 JOBS_FILE = BACKEND_DIR / "jobs.json"
 DEVICES_FILE = BACKEND_DIR / "devices.json"
+TENANTS_FILE = BACKEND_DIR / "tenants.json"
 CATALOG_FILE = BASE_DIR / "app_catalog.json"
 ALLOWED_APPS = {"vlc", "chrome", "7zip"}
 ALLOWED_ACTIONS = {"install", "uninstall"}
+TENANT_STATUSES = {"active", "inactive"}
 
 app = FastAPI(title="Systemo Agent Mock Backend")
 
@@ -43,6 +45,15 @@ class DeviceCheckInRequest(BaseModel):
     agent_name: str = "Systemo Agent"
     agent_version: str = "0.3.0"
     status: str = "online"
+
+
+class CreateTenantRequest(BaseModel):
+    company_name: str
+
+
+class UpdateTenantRequest(BaseModel):
+    company_name: Optional[str] = None
+    status: Optional[str] = None
 
 
 def utc_now():
@@ -108,6 +119,43 @@ def save_devices(devices):
         json.dump(devices, file, indent=2)
         file.write("\n")
     temp_file.replace(DEVICES_FILE)
+
+
+def load_tenants():
+    BACKEND_DIR.mkdir(parents=True, exist_ok=True)
+    if not TENANTS_FILE.exists():
+        save_tenants([])
+        return []
+
+    with TENANTS_FILE.open("r", encoding="utf-8") as file:
+        tenants = json.load(file)
+
+    if not isinstance(tenants, list):
+        raise HTTPException(status_code=500, detail="mock_backend/tenants.json must contain an array")
+
+    return tenants
+
+
+def save_tenants(tenants):
+    BACKEND_DIR.mkdir(parents=True, exist_ok=True)
+    temp_file = TENANTS_FILE.with_suffix(".json.tmp")
+    with temp_file.open("w", encoding="utf-8") as file:
+        json.dump(tenants, file, indent=2)
+        file.write("\n")
+    temp_file.replace(TENANTS_FILE)
+
+
+def normalize_company_name(company_name):
+    normalized_name = (company_name or "").strip()
+    if not normalized_name:
+        raise HTTPException(status_code=400, detail="company_name is required")
+    return normalized_name
+
+
+def validate_tenant_status(status):
+    if status not in TENANT_STATUSES:
+        raise HTTPException(status_code=400, detail="status must be active or inactive")
+    return status
 
 
 def get_dashboard_html():
@@ -238,6 +286,7 @@ def get_dashboard_html():
       font-weight: 600;
     }
 
+    input,
     select,
     button {
       min-height: 36px;
@@ -246,6 +295,7 @@ def get_dashboard_html():
       font: inherit;
     }
 
+    input,
     select {
       min-width: 150px;
       background: #ffffff;
@@ -370,6 +420,7 @@ def get_dashboard_html():
         grid-template-columns: 1fr;
       }
 
+      input,
       select,
       button {
         width: 100%;
@@ -387,6 +438,21 @@ def get_dashboard_html():
   </header>
 
   <main>
+    <section>
+      <div class="section-header">
+        <h2>Tenants / Companies</h2>
+      </div>
+      <form id="tenantForm" class="actions">
+        <label>
+          Company name
+          <input id="companyNameInput" name="company_name" type="text" required placeholder="Ybalai Builders">
+        </label>
+        <button type="submit">Create Tenant</button>
+      </form>
+      <div id="tenantMessage" class="message"></div>
+      <div id="tenantsTable" class="table-wrap"></div>
+    </section>
+
     <section>
       <div class="section-header">
         <h2>Create Job</h2>
@@ -425,6 +491,7 @@ def get_dashboard_html():
   </main>
 
   <script>
+    const tenantFields = ["tenant_id", "company_name", "status", "created_at", "updated_at"];
     const deviceFields = ["device_id", "hostname", "username", "os", "agent_version", "status", "last_seen_at"];
     const jobFields = ["id", "device_id", "app", "action", "status", "attempts", "message", "started_at", "finished_at"];
     const preferredApps = ["7zip", "vlc", "chrome"];
@@ -500,8 +567,9 @@ def get_dashboard_html():
 
     async function refreshAll() {
       try {
-        const [health, devices, jobs, catalog] = await Promise.all([
+        const [health, tenants, devices, jobs, catalog] = await Promise.all([
           fetchJson("/health"),
+          fetchJson("/api/admin/tenants"),
           fetchJson("/api/devices"),
           fetchJson("/api/agent/jobs/all"),
           fetchJson("/api/catalog"),
@@ -511,12 +579,35 @@ def get_dashboard_html():
         lastDevices = Array.isArray(devices) ? devices : [];
         lastCatalog = catalog;
         refreshFormOptions();
+        renderTable("tenantsTable", tenantFields, Array.isArray(tenants) ? tenants : []);
         renderTable("devicesTable", deviceFields, lastDevices);
         renderTable("jobsTable", jobFields, Array.isArray(jobs) ? [...jobs].reverse() : []);
       } catch (error) {
         setHealth(false, "Backend unavailable");
         document.getElementById("formMessage").textContent = error.message;
         document.getElementById("formMessage").className = "message error";
+      }
+    }
+
+    async function createTenant(event) {
+      event.preventDefault();
+      const message = document.getElementById("tenantMessage");
+      const input = document.getElementById("companyNameInput");
+      message.textContent = "";
+      message.className = "message";
+
+      try {
+        const tenant = await fetchJson("/api/admin/tenants", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ company_name: input.value }),
+        });
+        message.textContent = `Created tenant ${tenant.tenant_id}`;
+        input.value = "";
+        await refreshAll();
+      } catch (error) {
+        message.textContent = error.message;
+        message.className = "message error";
       }
     }
 
@@ -547,6 +638,7 @@ def get_dashboard_html():
     }
 
     document.getElementById("refreshButton").addEventListener("click", refreshAll);
+    document.getElementById("tenantForm").addEventListener("submit", createTenant);
     document.getElementById("jobForm").addEventListener("submit", createJob);
     refreshAll();
     setInterval(refreshAll, 5000);
@@ -570,6 +662,60 @@ def get_catalog():
     catalog = load_catalog()
     apps = [app_key for app_key in catalog.keys() if app_key in ALLOWED_APPS]
     return {"apps": apps, "actions": sorted(ALLOWED_ACTIONS)}
+
+
+@app.post("/api/admin/tenants")
+def create_tenant(request: CreateTenantRequest):
+    tenants = load_tenants()
+    now = utc_now()
+    tenant = {
+        "tenant_id": f"tenant-{uuid.uuid4().hex[:12]}",
+        "company_name": normalize_company_name(request.company_name),
+        "status": "active",
+        "created_at": now,
+        "updated_at": now,
+    }
+    tenants.append(tenant)
+    save_tenants(tenants)
+    return tenant
+
+
+@app.get("/api/admin/tenants")
+def get_tenants():
+    tenants = load_tenants()
+    return sorted(
+        tenants,
+        key=lambda tenant: tenant.get("created_at", "") if isinstance(tenant, dict) else "",
+        reverse=True,
+    )
+
+
+@app.get("/api/admin/tenants/{tenant_id}")
+def get_tenant(tenant_id: str):
+    tenants = load_tenants()
+    for tenant in tenants:
+        if isinstance(tenant, dict) and tenant.get("tenant_id") == tenant_id:
+            return tenant
+
+    raise HTTPException(status_code=404, detail="Tenant not found")
+
+
+@app.patch("/api/admin/tenants/{tenant_id}")
+def update_tenant(tenant_id: str, request: UpdateTenantRequest):
+    tenants = load_tenants()
+    for tenant in tenants:
+        if isinstance(tenant, dict) and tenant.get("tenant_id") == tenant_id:
+            if request.company_name is not None:
+                tenant["company_name"] = normalize_company_name(request.company_name)
+
+            if request.status is not None:
+                tenant["status"] = validate_tenant_status(request.status)
+
+            tenant["updated_at"] = utc_now()
+            save_tenants(tenants)
+            return tenant
+
+    raise HTTPException(status_code=404, detail="Tenant not found")
 
 
 @app.get("/api/agent/jobs")

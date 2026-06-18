@@ -301,6 +301,64 @@ Start-ScheduledTask -TaskName "Systemo Agent"
 
 From the dashboard, create a `7zip` `install` job, wait for the job table to update, then create a `7zip` `uninstall` job. The dashboard uses the mock API and approved catalog options only; it is for local development testing and does not include authentication yet.
 
+## Phase 9 Tenants / Companies
+
+The mock backend stores tenants in `mock_backend/tenants.json`. Tenants are local mock company records only; Phase 9 does not add enrollment tokens, agent enrollment, device approval, login, ticket approval, or AI.
+
+Start the mock server:
+
+```powershell
+python .\mock_server.py
+```
+
+Create tenant:
+
+```powershell
+python .\agent_cli.py api-create-tenant "Ybalai Builders"
+```
+
+List tenants:
+
+```powershell
+python .\agent_cli.py api-list-tenants
+```
+
+Show tenant:
+
+```powershell
+python .\agent_cli.py api-show-tenant <tenant_id>
+```
+
+Update tenant name:
+
+```powershell
+python .\agent_cli.py api-update-tenant <tenant_id> --name "Ybalai Builders Corp"
+```
+
+Deactivate tenant:
+
+```powershell
+python .\agent_cli.py api-update-tenant <tenant_id> --status inactive
+```
+
+Reactivate tenant:
+
+```powershell
+python .\agent_cli.py api-update-tenant <tenant_id> --status active
+```
+
+Confirm the existing API job flow still works:
+
+```powershell
+python .\agent_cli.py api-clear-jobs --yes
+python .\agent_cli.py api-add-job 7zip install
+Start-Sleep -Seconds 45
+python .\agent_cli.py api-list-jobs
+python .\agent_cli.py detect 7zip
+```
+
+The dashboard at `http://127.0.0.1:8008` also includes a Tenants / Companies section that lists tenants and creates a tenant by company name.
+
 To test VLC detection after uninstall:
 
 ```powershell

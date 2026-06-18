@@ -44,6 +44,13 @@ DEVICE_DISPLAY_FIELDS = [
     "status",
     "last_seen_at",
 ]
+TENANT_DISPLAY_FIELDS = [
+    "tenant_id",
+    "company_name",
+    "status",
+    "created_at",
+    "updated_at",
+]
 
 
 def load_json(path, default):
@@ -212,6 +219,80 @@ def api_show_device(device_id):
     response.raise_for_status()
     device = response.json()
     print_device(device)
+
+
+def print_tenant(tenant):
+    if not isinstance(tenant, dict):
+        print("- Invalid tenant entry")
+        return
+
+    print(f"- {get_job_value(tenant, 'tenant_id')}")
+    for field in TENANT_DISPLAY_FIELDS[1:]:
+        print(f"  {field}: {get_job_value(tenant, field)}")
+
+
+def print_tenants(tenants):
+    if not tenants:
+        print("No tenants found.")
+        return
+
+    for tenant in tenants:
+        print_tenant(tenant)
+
+
+def api_create_tenant(company_name):
+    config = load_or_create_agent_config()
+    requests = get_requests_module()
+    response = requests.post(
+        f"{get_api_base_url(config)}/api/admin/tenants",
+        json={"company_name": company_name},
+        timeout=10,
+    )
+    response.raise_for_status()
+    tenant = response.json()
+    print(f"Created tenant {tenant.get('tenant_id')} for {tenant.get('company_name')}")
+
+
+def api_list_tenants():
+    config = load_or_create_agent_config()
+    requests = get_requests_module()
+    response = requests.get(f"{get_api_base_url(config)}/api/admin/tenants", timeout=10)
+    response.raise_for_status()
+    tenants = response.json()
+    if not isinstance(tenants, list):
+        raise ValueError("API tenants response must be a JSON array")
+    print_tenants(tenants)
+
+
+def api_show_tenant(tenant_id):
+    config = load_or_create_agent_config()
+    requests = get_requests_module()
+    response = requests.get(f"{get_api_base_url(config)}/api/admin/tenants/{tenant_id}", timeout=10)
+    response.raise_for_status()
+    tenant = response.json()
+    print_tenant(tenant)
+
+
+def api_update_tenant(tenant_id, company_name=None, status=None):
+    if company_name is None and status is None:
+        raise ValueError("Provide --name and/or --status")
+
+    payload = {}
+    if company_name is not None:
+        payload["company_name"] = company_name
+    if status is not None:
+        payload["status"] = status
+
+    config = load_or_create_agent_config()
+    requests = get_requests_module()
+    response = requests.patch(
+        f"{get_api_base_url(config)}/api/admin/tenants/{tenant_id}",
+        json=payload,
+        timeout=10,
+    )
+    response.raise_for_status()
+    tenant = response.json()
+    print(f"Updated tenant {tenant.get('tenant_id')}.")
 
 
 def detect_app(app):
@@ -447,6 +528,19 @@ def build_parser():
     api_show_device_parser = subparsers.add_parser("api-show-device", help="Show one mock API device")
     api_show_device_parser.add_argument("device_id")
 
+    api_create_tenant_parser = subparsers.add_parser("api-create-tenant", help="Create a mock API tenant")
+    api_create_tenant_parser.add_argument("company_name")
+
+    subparsers.add_parser("api-list-tenants", help="List mock API tenants")
+
+    api_show_tenant_parser = subparsers.add_parser("api-show-tenant", help="Show one mock API tenant")
+    api_show_tenant_parser.add_argument("tenant_id")
+
+    api_update_tenant_parser = subparsers.add_parser("api-update-tenant", help="Update a mock API tenant")
+    api_update_tenant_parser.add_argument("tenant_id")
+    api_update_tenant_parser.add_argument("--name", dest="company_name")
+    api_update_tenant_parser.add_argument("--status", choices=["active", "inactive"])
+
     detect_parser = subparsers.add_parser("detect", help="Run approved app detection")
     detect_parser.add_argument("app")
 
@@ -488,6 +582,14 @@ def main():
             api_list_devices()
         elif args.command == "api-show-device":
             api_show_device(args.device_id)
+        elif args.command == "api-create-tenant":
+            api_create_tenant(args.company_name)
+        elif args.command == "api-list-tenants":
+            api_list_tenants()
+        elif args.command == "api-show-tenant":
+            api_show_tenant(args.tenant_id)
+        elif args.command == "api-update-tenant":
+            api_update_tenant(args.tenant_id, args.company_name, args.status)
         elif args.command == "detect":
             detect_app(args.app)
         elif args.command == "status":
