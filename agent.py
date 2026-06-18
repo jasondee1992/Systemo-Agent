@@ -119,6 +119,8 @@ def load_or_create_agent_config():
             "agent_version": AGENT_VERSION,
             "job_source": config.get("job_source") or DEFAULT_JOB_SOURCE,
             "api_base_url": config.get("api_base_url") or DEFAULT_API_BASE_URL,
+            "company_id": config.get("company_id"),
+            "company_name": config.get("company_name"),
         }
     )
 
@@ -137,6 +139,8 @@ def load_agent_config():
         "agent_version": config.get("agent_version") or AGENT_VERSION,
         "job_source": config.get("job_source") or DEFAULT_JOB_SOURCE,
         "api_base_url": config.get("api_base_url") or DEFAULT_API_BASE_URL,
+        "company_id": config.get("company_id"),
+        "company_name": config.get("company_name"),
     }
 
 
@@ -151,6 +155,8 @@ def build_agent_state(
         "status": status,
         "last_heartbeat_at": utc_now(),
         "device_id": config.get("device_id"),
+        "company_id": config.get("company_id"),
+        "company_name": config.get("company_name"),
         "hostname": config.get("hostname"),
         "agent_version": config.get("agent_version"),
         "current_pid": os.getpid(),
@@ -592,8 +598,12 @@ def report_api_job_result(config, job):
 def check_in_with_api(config):
     requests = get_requests_module()
     api_base_url = get_api_base_url(config)
+    if not config.get("company_name") and not config.get("company_id"):
+        LOGGER.warning("API check-in skipped company warning: no company configured")
     payload = {
         "device_id": config.get("device_id"),
+        "company_id": config.get("company_id"),
+        "company_name": config.get("company_name"),
         "hostname": config.get("hostname"),
         "username": config.get("username"),
         "os": config.get("os"),

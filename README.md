@@ -359,6 +359,156 @@ python .\agent_cli.py detect 7zip
 
 The dashboard at `http://127.0.0.1:8008` also includes a Tenants / Companies section that lists tenants and creates a tenant by company name.
 
+## Phase 10A Company Enrollment
+
+Phase 10A adds manual company enrollment and device approval. The mock backend uses company records in `mock_backend/tenants.json` with a stable `company_id`, such as `Ybalai Builders` becoming `ybalai-builders`. Devices that check in with a new company name automatically create that company.
+
+New devices start with `approval_status` set to `pending_approval`. Pending or rejected devices do not receive executable API jobs. Approved devices only receive jobs for their own company.
+
+Start the mock server:
+
+```powershell
+python .\mock_server.py
+```
+
+Enroll this device under a manually typed company name:
+
+```powershell
+python .\agent_cli.py enroll-device --company "Ybalai Builders"
+python .\agent_cli.py set-mode api
+Stop-ScheduledTask -TaskName "Systemo Agent"
+Start-ScheduledTask -TaskName "Systemo Agent"
+```
+
+Wait 10-20 seconds, then verify the device appears as pending:
+
+```powershell
+python .\agent_cli.py api-list-companies
+python .\agent_cli.py api-list-devices
+```
+
+Approve the device:
+
+```powershell
+python .\agent_cli.py api-approve-device <device_id>
+```
+
+Create and verify an API install job:
+
+```powershell
+python .\agent_cli.py api-clear-jobs --yes
+python .\agent_cli.py api-add-job 7zip install
+Start-Sleep -Seconds 45
+python .\agent_cli.py api-list-jobs
+python .\agent_cli.py detect 7zip
+```
+
+Create and verify an API uninstall job:
+
+```powershell
+python .\agent_cli.py api-add-job 7zip uninstall
+Start-Sleep -Seconds 45
+python .\agent_cli.py api-list-jobs
+python .\agent_cli.py detect 7zip
+```
+
+Verify pending or rejected devices do not execute jobs:
+
+```powershell
+python .\agent_cli.py api-reject-device <device_id>
+python .\agent_cli.py api-add-job 7zip install
+Start-Sleep -Seconds 20
+python .\agent_cli.py api-list-jobs
+```
+
+The job should remain `approved` with `attempts: 0` until the device is approved again.
+
+```powershell
+python .\agent_cli.py api-approve-device <device_id>
+```
+
+The dashboard at `http://127.0.0.1:8008` shows companies, devices with approval status, approve/reject buttons, and a company-scoped job creation form.
+
+## Phase 10B Dashboard Login and Roles
+
+The mock dashboard now requires login. Prototype users are stored in `mock_backend/users.json` and are seeded automatically when missing.
+
+Default users:
+
+- `admin` / `admin123` / `system_admin`
+- `ybalai_admin` / `admin123` / `company_admin` for `ybalai-builders`
+- `ybalai_viewer` / `admin123` / `viewer` for `ybalai-builders`
+
+Dashboard role rules:
+
+- `system_admin` can view all companies, devices, and jobs, approve/reject any device, and create jobs for any company.
+- `company_admin` can only view and manage its own company devices/jobs.
+- `viewer` can only view its assigned company and cannot approve/reject devices or create jobs.
+
+The agent check-in and job polling endpoints remain tokenless for this prototype, but approved-device and company-scoping checks still apply.
+
+Start the mock server:
+
+```powershell
+python .\mock_server.py
+```
+
+Enroll device under a company:
+
+```powershell
+python .\agent_cli.py enroll-device --company "Ybalai Builders"
+python .\agent_cli.py set-mode api
+Stop-ScheduledTask -TaskName "Systemo Agent"
+Start-ScheduledTask -TaskName "Systemo Agent"
+```
+
+Open the dashboard:
+
+```text
+http://127.0.0.1:8008
+```
+
+Login as system admin:
+
+```text
+username: admin
+password: admin123
+```
+
+Verify all companies/devices are visible, approve the pending device, then create a `7zip` install job from the dashboard. Confirm the agent executes it:
+
+```powershell
+Start-Sleep -Seconds 45
+python .\agent_cli.py api-list-jobs
+python .\agent_cli.py detect 7zip
+```
+
+Create a `7zip` uninstall job from the dashboard and confirm it executes:
+
+```powershell
+Start-Sleep -Seconds 45
+python .\agent_cli.py api-list-jobs
+python .\agent_cli.py detect 7zip
+```
+
+Logout, then login as company admin:
+
+```text
+username: ybalai_admin
+password: admin123
+```
+
+Verify only the `Ybalai Builders` company, devices, and jobs are visible. Company admins cannot access other company actions through protected dashboard APIs.
+
+Logout, then login as viewer:
+
+```text
+username: ybalai_viewer
+password: admin123
+```
+
+Verify the dashboard is read-only: no create job form and no approve/reject buttons. Agent job processing still works for approved jobs created by an admin.
+
 To test VLC detection after uninstall:
 
 ```powershell

@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -37,12 +38,21 @@ JOB_DISPLAY_FIELDS = [
 ]
 DEVICE_DISPLAY_FIELDS = [
     "device_id",
+    "company_name",
+    "company_id",
     "hostname",
     "username",
     "os",
     "agent_version",
     "status",
+    "approval_status",
     "last_seen_at",
+]
+COMPANY_DISPLAY_FIELDS = [
+    "company_id",
+    "company_name",
+    "created_at",
+    "updated_at",
 ]
 TENANT_DISPLAY_FIELDS = [
     "tenant_id",
@@ -91,6 +101,26 @@ def get_requests_module():
 
 def get_api_base_url(config):
     return str(config.get("api_base_url") or DEFAULT_API_BASE_URL).rstrip("/")
+
+
+def slugify_company_name(company_name):
+    normalized_name = (company_name or "").strip().lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", normalized_name).strip("-")
+    if not slug:
+        raise ValueError("Company name must contain letters or numbers")
+    return slug
+
+
+def register_company(company_name):
+    normalized_name = (company_name or "").strip()
+    if not normalized_name:
+        raise ValueError("Company name is required")
+
+    config = load_or_create_agent_config()
+    config["company_name"] = normalized_name
+    config["company_id"] = slugify_company_name(normalized_name)
+    save_json(CONFIG_FILE, config)
+    print(f"Registered company {config['company_name']} ({config['company_id']}).")
 
 
 def validate_app_action(app, action):
@@ -143,9 +173,14 @@ def api_add_job(app, action="install"):
 
     config = load_or_create_agent_config()
     requests = get_requests_module()
+    payload = {"device_id": "any", "app": app, "action": action}
+    if config.get("company_id"):
+        payload["company_id"] = config.get("company_id")
+    if config.get("company_name"):
+        payload["company_name"] = config.get("company_name")
     response = requests.post(
         f"{get_api_base_url(config)}/api/agent/jobs",
-        json={"device_id": "any", "app": app, "action": action},
+        json=payload,
         timeout=10,
     )
     response.raise_for_status()
@@ -219,6 +254,60 @@ def api_show_device(device_id):
     response.raise_for_status()
     device = response.json()
     print_device(device)
+
+
+def print_company(company):
+    if not isinstance(company, dict):
+        print("- Invalid company entry")
+        return
+
+    print(f"- {get_job_value(company, 'company_id')}")
+    for field in COMPANY_DISPLAY_FIELDS[1:]:
+        print(f"  {field}: {get_job_value(company, field)}")
+
+
+def print_companies(companies):
+    if not companies:
+        print("No companies found.")
+        return
+
+    for company in companies:
+        print_company(company)
+
+
+def api_list_companies():
+    config = load_or_create_agent_config()
+    requests = get_requests_module()
+    response = requests.get(f"{get_api_base_url(config)}/api/admin/companies", timeout=10)
+    response.raise_for_status()
+    companies = response.json()
+    if not isinstance(companies, list):
+        raise ValueError("API companies response must be a JSON array")
+    print_companies(companies)
+
+
+def api_approve_device(device_id):
+    config = load_or_create_agent_config()
+    requests = get_requests_module()
+    response = requests.post(
+        f"{get_api_base_url(config)}/api/admin/devices/{device_id}/approve",
+        timeout=10,
+    )
+    response.raise_for_status()
+    device = response.json()
+    print(f"Approved device {device.get('device_id')}.")
+
+
+def api_reject_device(device_id):
+    config = load_or_create_agent_config()
+    requests = get_requests_module()
+    response = requests.post(
+        f"{get_api_base_url(config)}/api/admin/devices/{device_id}/reject",
+        timeout=10,
+    )
+    response.raise_for_status()
+    device = response.json()
+    print(f"Rejected device {device.get('device_id')}.")
 
 
 def print_tenant(tenant):
@@ -437,6 +526,8 @@ def print_info():
         "agent_name",
         "agent_version",
         "device_id",
+        "company_id",
+        "company_name",
         "hostname",
         "os",
         "username",
@@ -499,6 +590,10 @@ def print_health():
     print(f"job_source: {job_source}")
     if job_source == "api":
         print(f"api_base_url: {config.get('api_base_url') or DEFAULT_API_BASE_URL}")
+        print(f"company_id: {config.get('company_id') or '-'}")
+        print(f"company_name: {config.get('company_name') or '-'}")
+        if not config.get("company_id") and not config.get("company_name"):
+            print("company_warning: no company configured; API check-in and jobs are company-scoped")
 
 
 def build_parser():
@@ -510,6 +605,12 @@ def build_parser():
     add_job_parser.add_argument("action", nargs="?", default="install", choices=sorted(ALLOWED_ACTIONS))
 
     subparsers.add_parser("mode", help="Print current job source mode")
+
+    register_company_parser = subparsers.add_parser("register-company", help="Store local company enrollment")
+    register_company_parser.add_argument("company_name")
+
+    enroll_device_parser = subparsers.add_parser("enroll-device", help="Store local device company enrollment")
+    enroll_device_parser.add_argument("--company", required=True)
 
     set_mode_parser = subparsers.add_parser("set-mode", help="Set job source mode")
     set_mode_parser.add_argument("mode", choices=["local", "api"])
@@ -527,6 +628,14 @@ def build_parser():
 
     api_show_device_parser = subparsers.add_parser("api-show-device", help="Show one mock API device")
     api_show_device_parser.add_argument("device_id")
+
+    subparsers.add_parser("api-list-companies", help="List mock API companies")
+
+    api_approve_device_parser = subparsers.add_parser("api-approve-device", help="Approve a mock API device")
+    api_approve_device_parser.add_argument("device_id")
+
+    api_reject_device_parser = subparsers.add_parser("api-reject-device", help="Reject a mock API device")
+    api_reject_device_parser.add_argument("device_id")
 
     api_create_tenant_parser = subparsers.add_parser("api-create-tenant", help="Create a mock API tenant")
     api_create_tenant_parser.add_argument("company_name")
@@ -570,6 +679,10 @@ def main():
             add_job(args.app, args.action)
         elif args.command == "mode":
             print_mode()
+        elif args.command == "register-company":
+            register_company(args.company_name)
+        elif args.command == "enroll-device":
+            register_company(args.company)
         elif args.command == "set-mode":
             set_mode(args.mode)
         elif args.command == "api-add-job":
@@ -582,6 +695,12 @@ def main():
             api_list_devices()
         elif args.command == "api-show-device":
             api_show_device(args.device_id)
+        elif args.command == "api-list-companies":
+            api_list_companies()
+        elif args.command == "api-approve-device":
+            api_approve_device(args.device_id)
+        elif args.command == "api-reject-device":
+            api_reject_device(args.device_id)
         elif args.command == "api-create-tenant":
             api_create_tenant(args.company_name)
         elif args.command == "api-list-tenants":
