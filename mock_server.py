@@ -19,6 +19,7 @@ DEVICES_FILE = BACKEND_DIR / "devices.json"
 TENANTS_FILE = BACKEND_DIR / "tenants.json"
 USERS_FILE = BACKEND_DIR / "users.json"
 APP_REQUESTS_FILE = BACKEND_DIR / "app_requests.json"
+AUDIT_LOGS_FILE = BACKEND_DIR / "audit_logs.json"
 CATALOG_FILE = BASE_DIR / "app_catalog.json"
 ALLOWED_APPS = {"vlc", "chrome", "7zip"}
 ALLOWED_ACTIONS = {"install", "uninstall"}
@@ -88,6 +89,14 @@ class AppRequestDecisionRequest(BaseModel):
     reason: Optional[str] = None
 
 
+AUDIT_JOB_RESULT_EVENTS = {
+    "success": "JOB_SUCCESS",
+    "failed": "JOB_FAILED",
+    "requires_user_action": "JOB_FAILED",
+    "skipped": "JOB_SKIPPED",
+}
+
+
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -151,6 +160,67 @@ def save_app_requests(app_requests):
         json.dump(app_requests, file, indent=2)
         file.write("\n")
     temp_file.replace(APP_REQUESTS_FILE)
+
+
+def load_audit_logs():
+    BACKEND_DIR.mkdir(parents=True, exist_ok=True)
+    if not AUDIT_LOGS_FILE.exists():
+        save_audit_logs([])
+        return []
+
+    with AUDIT_LOGS_FILE.open("r", encoding="utf-8") as file:
+        audit_logs = json.load(file)
+
+    if not isinstance(audit_logs, list):
+        raise HTTPException(status_code=500, detail="mock_backend/audit_logs.json must contain an array")
+
+    return audit_logs
+
+
+def save_audit_logs(audit_logs):
+    BACKEND_DIR.mkdir(parents=True, exist_ok=True)
+    temp_file = AUDIT_LOGS_FILE.with_suffix(".json.tmp")
+    with temp_file.open("w", encoding="utf-8") as file:
+        json.dump(audit_logs, file, indent=2)
+        file.write("\n")
+    temp_file.replace(AUDIT_LOGS_FILE)
+
+
+def log_audit(
+    event_type,
+    message,
+    company_id=None,
+    company_name=None,
+    actor=None,
+    device_id=None,
+    request_id=None,
+    job_id=None,
+    target_type=None,
+    target_label=None,
+    metadata=None,
+):
+    actor = actor if isinstance(actor, dict) else {}
+    audit_entry = {
+        "audit_id": f"audit-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}",
+        "event_type": event_type,
+        "company_id": company_id,
+        "company_name": company_name,
+        "actor_user_id": actor.get("user_id"),
+        "actor_username": actor.get("username"),
+        "actor_role": actor.get("role"),
+        "device_id": device_id,
+        "request_id": request_id,
+        "job_id": job_id,
+        "target_type": target_type,
+        "target_label": target_label,
+        "message": message,
+        "metadata": metadata or {},
+        "created_at": utc_now(),
+    }
+    audit_logs = load_audit_logs()
+    audit_logs.append(audit_entry)
+    save_audit_logs(audit_logs)
+    return audit_entry
 
 
 def load_devices():
@@ -409,6 +479,15 @@ def clear_session_cookie(request: Request, response: Response):
 
 def require_role(user, allowed_roles):
     if user.get("role") not in allowed_roles:
+        log_audit(
+            "UNAUTHORIZED_ACCESS_ATTEMPT",
+            "User attempted an action without the required role",
+            company_id=user.get("company_id"),
+            actor=user,
+            target_type="role",
+            target_label=user.get("role"),
+            metadata={"allowed_roles": sorted(allowed_roles)},
+        )
         raise HTTPException(status_code=403, detail="Forbidden")
 
 
@@ -452,10 +531,29 @@ def filter_app_requests_for_user(app_requests, user):
     ]
 
 
+def filter_audit_logs_for_user(audit_logs, user):
+    if user.get("role") == "system_admin":
+        return audit_logs
+    return [
+        audit_entry
+        for audit_entry in audit_logs
+        if isinstance(audit_entry, dict) and audit_entry.get("company_id") == user.get("company_id")
+    ]
+
+
 def assert_company_access(user, company_id):
     if user.get("role") == "system_admin":
         return
     if user.get("company_id") != company_id:
+        log_audit(
+            "UNAUTHORIZED_ACCESS_ATTEMPT",
+            "User attempted to access another company",
+            company_id=company_id,
+            actor=user,
+            target_type="company",
+            target_label=company_id,
+            metadata={"user_company_id": user.get("company_id")},
+        )
         raise HTTPException(status_code=403, detail="Forbidden")
 
 
@@ -581,6 +679,18 @@ def create_app_request_record(payload, user):
     app_requests = load_app_requests()
     app_requests.append(app_request)
     save_app_requests(app_requests)
+    log_audit(
+        "APP_REQUEST_CREATED",
+        f"App request created for {payload.app} {payload.action}",
+        company_id=company_id,
+        company_name=company_name,
+        actor=user,
+        device_id=None if target_device_id == "any" else target_device_id,
+        request_id=app_request.get("request_id"),
+        target_type=target_type,
+        target_label=target_device_id,
+        metadata={"app": payload.app, "action": payload.action, "reason": payload.reason},
+    )
     return app_request
 
 
@@ -611,6 +721,7 @@ def approve_app_request_record(request_id, user, decision):
         approved_by_user_id=user.get("user_id"),
         approved_by_username=user.get("username"),
         source_request_id=app_request.get("request_id"),
+        actor=user,
     )
 
     app_request["status"] = "converted_to_job"
@@ -621,6 +732,19 @@ def approve_app_request_record(request_id, user, decision):
         app_request["reason"] = decision.reason
     app_request["updated_at"] = utc_now()
     save_app_requests(app_requests)
+    log_audit(
+        "APP_REQUEST_APPROVED",
+        f"App request approved and converted to job {job.get('id')}",
+        company_id=app_request.get("company_id"),
+        company_name=app_request.get("company_name"),
+        actor=user,
+        device_id=None if target_device_id == "any" else target_device_id,
+        request_id=app_request.get("request_id"),
+        job_id=job.get("id"),
+        target_type=app_request.get("target_type"),
+        target_label=target_device_id,
+        metadata={"app": app_request.get("app"), "action": app_request.get("action")},
+    )
     return app_request
 
 
@@ -641,6 +765,18 @@ def reject_app_request_record(request_id, user, decision):
         app_request["reason"] = decision.reason
     app_request["updated_at"] = utc_now()
     save_app_requests(app_requests)
+    log_audit(
+        "APP_REQUEST_REJECTED",
+        "App request rejected",
+        company_id=app_request.get("company_id"),
+        company_name=app_request.get("company_name"),
+        actor=user,
+        device_id=app_request.get("device_id"),
+        request_id=app_request.get("request_id"),
+        target_type=app_request.get("target_type"),
+        target_label=app_request.get("target_device_id"),
+        metadata={"app": app_request.get("app"), "action": app_request.get("action"), "reason": decision.reason},
+    )
     return app_request
 
 
@@ -1127,6 +1263,24 @@ def get_dashboard_html():
       </div>
       <div id="jobsTable" class="table-wrap"></div>
     </section>
+
+    <section>
+      <div class="section-header">
+        <h2>Audit Logs</h2>
+      </div>
+      <form id="auditFilterForm" class="actions">
+        <label id="auditCompanyLabel">
+          Company
+          <select id="auditCompanySelect" name="company_id"></select>
+        </label>
+        <label>
+          Event type
+          <select id="auditEventSelect" name="event_type"></select>
+        </label>
+        <button type="submit" class="secondary">Apply</button>
+      </form>
+      <div id="auditTable" class="table-wrap"></div>
+    </section>
   </main>
 
   <script>
@@ -1134,6 +1288,26 @@ def get_dashboard_html():
     const deviceFields = ["company_name", "hostname", "username", "os", "agent_version", "connection_status", "approval_status", "last_seen_at"];
     const requestFields = ["request_id", "company_name", "target_device_id", "app", "action", "requested_by_username", "status", "linked_job_id", "created_at"];
     const jobFields = ["id", "company_name", "device_id", "app", "action", "status", "attempts", "message", "started_at", "finished_at"];
+    const auditFields = ["created_at", "event_type", "company_name", "actor_username", "actor_role", "target_label", "message"];
+    const auditEventTypes = [
+      "ALL",
+      "USER_LOGIN_SUCCESS",
+      "USER_LOGIN_FAILED",
+      "USER_LOGOUT",
+      "DEVICE_ENROLLED",
+      "DEVICE_HEARTBEAT_FIRST_SEEN",
+      "DEVICE_APPROVED",
+      "DEVICE_REJECTED",
+      "APP_REQUEST_CREATED",
+      "APP_REQUEST_APPROVED",
+      "APP_REQUEST_REJECTED",
+      "JOB_CREATED",
+      "JOB_STARTED",
+      "JOB_SUCCESS",
+      "JOB_FAILED",
+      "JOB_SKIPPED",
+      "UNAUTHORIZED_ACCESS_ATTEMPT",
+    ];
     const preferredApps = ["7zip", "vlc", "chrome"];
     let currentUser = null;
     let lastCompanies = [];
@@ -1262,6 +1436,30 @@ def get_dashboard_html():
       populateSelect("actionSelect", lastCatalog.actions);
     }
 
+    function refreshAuditFilters() {
+      const auditCompanySelect = document.getElementById("auditCompanySelect");
+      const currentCompany = auditCompanySelect.value;
+      const companyOptions = ["ALL", ...lastCompanies.map((company) => company.company_id)];
+      populateSelect("auditCompanySelect", companyOptions);
+      if (companyOptions.includes(currentCompany)) {
+        auditCompanySelect.value = currentCompany;
+      }
+      populateSelect("auditEventSelect", auditEventTypes);
+    }
+
+    function getAuditPath() {
+      const params = new URLSearchParams({ limit: "100" });
+      const companyId = document.getElementById("auditCompanySelect").value;
+      const eventType = document.getElementById("auditEventSelect").value;
+      if (companyId && companyId !== "ALL") {
+        params.set("company_id", companyId);
+      }
+      if (eventType && eventType !== "ALL") {
+        params.set("event_type", eventType);
+      }
+      return `/api/audit-logs?${params.toString()}`;
+    }
+
     function applyRoleUi() {
       if (!currentUser) {
         return;
@@ -1270,17 +1468,19 @@ def get_dashboard_html():
       document.getElementById("companyForm").style.display = currentUser.role === "system_admin" ? "" : "none";
       document.getElementById("requestSection").style.display = "";
       document.getElementById("companySelect").disabled = currentUser.role !== "system_admin";
+      document.getElementById("auditCompanyLabel").style.display = currentUser.role === "system_admin" ? "" : "none";
     }
 
     async function refreshAll() {
       try {
-        const [session, health, companies, devices, requests, jobs, catalog] = await Promise.all([
+        const [session, health, companies, devices, requests, jobs, auditLogs, catalog] = await Promise.all([
           fetchJson("/dashboard/api/session"),
           fetchJson("/health"),
           fetchJson("/dashboard/api/companies"),
           fetchJson("/dashboard/api/devices"),
           fetchJson("/api/app-requests"),
           fetchJson("/dashboard/api/jobs"),
+          fetchJson(getAuditPath()),
           fetchJson("/dashboard/api/catalog"),
         ]);
 
@@ -1291,10 +1491,12 @@ def get_dashboard_html():
         lastDevices = Array.isArray(devices) ? devices : [];
         lastCatalog = catalog;
         refreshFormOptions();
+        refreshAuditFilters();
         renderTable("companiesTable", companyFields, lastCompanies);
         renderDevices(lastDevices);
         renderRequests(Array.isArray(requests) ? [...requests].reverse() : []);
         renderTable("jobsTable", jobFields, Array.isArray(jobs) ? [...jobs].reverse() : []);
+        renderTable("auditTable", auditFields, Array.isArray(auditLogs) ? auditLogs : []);
       } catch (error) {
         setHealth(false, "Backend unavailable");
         document.getElementById("formMessage").textContent = error.message;
@@ -1383,6 +1585,10 @@ def get_dashboard_html():
     document.getElementById("companySelect").addEventListener("change", refreshFormOptions);
     document.getElementById("companyForm").addEventListener("submit", createCompany);
     document.getElementById("requestForm").addEventListener("submit", createAppRequest);
+    document.getElementById("auditFilterForm").addEventListener("submit", (event) => {
+      event.preventDefault();
+      refreshAll();
+    });
     document.getElementById("devicesTable").addEventListener("click", (event) => {
       const approveId = event.target.getAttribute("data-approve");
       const rejectId = event.target.getAttribute("data-reject");
@@ -1421,7 +1627,22 @@ def login_page(request: Request):
 def login(request: LoginRequest):
     user = authenticate_user(request.username, request.password)
     if user is None:
+        log_audit(
+            "USER_LOGIN_FAILED",
+            f"Login failed for username {request.username}",
+            target_type="user",
+            target_label=request.username,
+            metadata={"username": request.username},
+        )
         raise HTTPException(status_code=401, detail="Invalid username or password")
+    log_audit(
+        "USER_LOGIN_SUCCESS",
+        f"User {user.get('username')} logged in",
+        company_id=user.get("company_id"),
+        actor=user,
+        target_type="user",
+        target_label=user.get("username"),
+    )
     response = JSONResponse({"user": public_user(user)})
     set_session_cookie(response, user)
     return response
@@ -1429,6 +1650,16 @@ def login(request: LoginRequest):
 
 @app.post("/logout")
 def logout(request: Request):
+    user = get_optional_user(request)
+    if user is not None:
+        log_audit(
+            "USER_LOGOUT",
+            f"User {user.get('username')} logged out",
+            company_id=user.get("company_id"),
+            actor=user,
+            target_type="user",
+            target_label=user.get("username"),
+        )
     response = JSONResponse({"status": "ok"})
     clear_session_cookie(request, response)
     return response
@@ -1477,7 +1708,7 @@ def dashboard_approve_device(request: Request, device_id: str):
     user = get_current_user(request)
     device = get_device(device_id)
     assert_can_manage_device(user, device)
-    return approve_device(device_id)
+    return approve_device(device_id, actor=user)
 
 
 @app.post("/dashboard/api/devices/{device_id}/reject")
@@ -1485,7 +1716,7 @@ def dashboard_reject_device(request: Request, device_id: str):
     user = get_current_user(request)
     device = get_device(device_id)
     assert_can_manage_device(user, device)
-    return reject_device(device_id)
+    return reject_device(device_id, actor=user)
 
 
 @app.get("/dashboard/api/jobs")
@@ -1506,7 +1737,7 @@ def dashboard_create_job(request: Request, payload: CreateJobRequest):
     if not company_id:
         raise HTTPException(status_code=400, detail="company_id is required")
     assert_can_create_job(user, company_id)
-    return create_job(payload)
+    return create_job(payload, actor=user)
 
 
 @app.post("/api/app-requests")
@@ -1543,6 +1774,41 @@ def reject_app_request(
     if decision is None:
         decision = AppRequestDecisionRequest()
     return reject_app_request_record(request_id, user, decision)
+
+
+@app.get("/api/audit-logs")
+def get_audit_logs(
+    request: Request,
+    company_id: Optional[str] = None,
+    event_type: Optional[str] = None,
+    limit: int = 100,
+):
+    user = get_current_user(request)
+    audit_logs = load_audit_logs()
+    if company_id:
+        assert_company_access(user, company_id)
+        audit_logs = [
+            audit_entry
+            for audit_entry in audit_logs
+            if isinstance(audit_entry, dict) and audit_entry.get("company_id") == company_id
+        ]
+    else:
+        audit_logs = filter_audit_logs_for_user(audit_logs, user)
+
+    if event_type:
+        audit_logs = [
+            audit_entry
+            for audit_entry in audit_logs
+            if isinstance(audit_entry, dict) and audit_entry.get("event_type") == event_type
+        ]
+
+    sorted_logs = sorted(
+        audit_logs,
+        key=lambda audit_entry: audit_entry.get("created_at", "") if isinstance(audit_entry, dict) else "",
+        reverse=True,
+    )
+    safe_limit = max(1, min(int(limit or 100), 500))
+    return sorted_logs[:safe_limit]
 
 
 @app.get("/health")
@@ -1641,7 +1907,7 @@ def get_agent_jobs(device_id: str):
         return []
 
     jobs = load_jobs()
-    return [
+    matching_jobs = [
         job
         for job in jobs
         if isinstance(job, dict)
@@ -1649,10 +1915,30 @@ def get_agent_jobs(device_id: str):
         and job.get("company_id") == company_id
         and job.get("device_id") in {device_id, "any"}
     ]
+    audit_updated = False
+    for job in matching_jobs:
+        if not job.get("audit_started_at"):
+            job["audit_started_at"] = utc_now()
+            audit_updated = True
+            log_audit(
+                "JOB_STARTED",
+                f"Agent fetched job {job.get('id')} for processing",
+                company_id=job.get("company_id"),
+                company_name=job.get("company_name"),
+                device_id=device_id,
+                request_id=job.get("source_request_id"),
+                job_id=job.get("id"),
+                target_type="job",
+                target_label=job.get("id"),
+                metadata={"app": job.get("app"), "action": job.get("action"), "status": job.get("status")},
+            )
+    if audit_updated:
+        save_jobs(jobs)
+    return matching_jobs
 
 
 @app.post("/api/agent/jobs")
-def create_job(request: CreateJobRequest):
+def create_job(request: CreateJobRequest, actor=None):
     if request.app not in ALLOWED_APPS:
         raise HTTPException(status_code=400, detail="Unsupported app")
 
@@ -1688,6 +1974,7 @@ def create_job(request: CreateJobRequest):
         device_id=request.device_id,
         company_id=company_id,
         company_name=company_name,
+        actor=actor,
     )
 
 
@@ -1702,6 +1989,7 @@ def create_executable_job(
     approved_by_user_id=None,
     approved_by_username=None,
     source_request_id=None,
+    actor=None,
 ):
     jobs = load_jobs()
     job = {
@@ -1726,6 +2014,19 @@ def create_executable_job(
     }
     jobs.append(job)
     save_jobs(jobs)
+    log_audit(
+        "JOB_CREATED",
+        f"Executable job created for {app} {action}",
+        company_id=company_id,
+        company_name=company_name,
+        actor=actor,
+        device_id=None if device_id == "any" else device_id,
+        request_id=source_request_id,
+        job_id=job.get("id"),
+        target_type="any_approved_device" if device_id == "any" else "specific_device",
+        target_label=device_id,
+        metadata={"app": app, "action": action},
+    )
     return job
 
 
@@ -1734,8 +2035,31 @@ def post_job_result(job_id: str, result: JobResultRequest):
     jobs = load_jobs()
     for job in jobs:
         if isinstance(job, dict) and job.get("id") == job_id:
+            previous_audit_status = job.get("audit_result_status")
             update = result.dict(exclude_unset=True)
             job.update(update)
+            result_status = job.get("status")
+            event_type = AUDIT_JOB_RESULT_EVENTS.get(result_status)
+            if event_type and previous_audit_status != result_status:
+                job["audit_result_status"] = result_status
+                log_audit(
+                    event_type,
+                    f"Job {job_id} finished with status {result_status}",
+                    company_id=job.get("company_id"),
+                    company_name=job.get("company_name"),
+                    device_id=job.get("device_id") if job.get("device_id") != "any" else None,
+                    request_id=job.get("source_request_id"),
+                    job_id=job_id,
+                    target_type="job",
+                    target_label=job_id,
+                    metadata={
+                        "app": job.get("app"),
+                        "action": job.get("action"),
+                        "status": result_status,
+                        "message": job.get("message"),
+                        "last_error": job.get("last_error"),
+                    },
+                )
             save_jobs(jobs)
             return job
 
@@ -1781,6 +2105,26 @@ def check_in_device(request: DeviceCheckInRequest):
     device_update["approval_status"] = "pending_approval"
     devices.append(device_update)
     save_devices(devices)
+    log_audit(
+        "DEVICE_ENROLLED",
+        f"Device {request.device_id} enrolled for {company.get('company_name')}",
+        company_id=company.get("company_id"),
+        company_name=company.get("company_name"),
+        device_id=request.device_id,
+        target_type="device",
+        target_label=request.hostname or request.device_id,
+        metadata={"hostname": request.hostname, "username": request.username, "os": request.os},
+    )
+    log_audit(
+        "DEVICE_HEARTBEAT_FIRST_SEEN",
+        f"First heartbeat received from device {request.device_id}",
+        company_id=company.get("company_id"),
+        company_name=company.get("company_name"),
+        device_id=request.device_id,
+        target_type="device",
+        target_label=request.hostname or request.device_id,
+        metadata={"agent_version": request.agent_version, "status": request.status},
+    )
     return device_update
 
 
@@ -1813,24 +2157,44 @@ def get_device(device_id: str):
 
 
 @app.post("/api/admin/devices/{device_id}/approve")
-def approve_device(device_id: str):
+def approve_device(device_id: str, actor=None):
     devices = load_devices()
     for device in devices:
         if isinstance(device, dict) and device.get("device_id") == device_id:
             device["approval_status"] = "approved"
             save_devices(devices)
+            log_audit(
+                "DEVICE_APPROVED",
+                f"Device {device_id} approved",
+                company_id=device.get("company_id"),
+                company_name=device.get("company_name"),
+                actor=actor,
+                device_id=device_id,
+                target_type="device",
+                target_label=device.get("hostname") or device_id,
+            )
             return device
 
     raise HTTPException(status_code=404, detail="Device not found")
 
 
 @app.post("/api/admin/devices/{device_id}/reject")
-def reject_device(device_id: str):
+def reject_device(device_id: str, actor=None):
     devices = load_devices()
     for device in devices:
         if isinstance(device, dict) and device.get("device_id") == device_id:
             device["approval_status"] = "rejected"
             save_devices(devices)
+            log_audit(
+                "DEVICE_REJECTED",
+                f"Device {device_id} rejected",
+                company_id=device.get("company_id"),
+                company_name=device.get("company_name"),
+                actor=actor,
+                device_id=device_id,
+                target_type="device",
+                target_label=device.get("hostname") or device_id,
+            )
             return device
 
     raise HTTPException(status_code=404, detail="Device not found")

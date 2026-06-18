@@ -598,6 +598,91 @@ Start-Sleep -Seconds 45
 python .\agent_cli.py api-list-jobs
 ```
 
+## Phase 10D Audit Logs and Activity Timeline
+
+The mock backend writes audit logs to `mock_backend/audit_logs.json`. The dashboard includes an Audit Logs section that shows the latest activity first.
+
+Audit events include:
+
+- User login success, login failure, and logout.
+- Device enrollment, first heartbeat, approval, and rejection.
+- App request creation, approval, and rejection.
+- Job creation, agent job start, success, failure, and skipped results.
+- Useful unauthorized access attempts.
+
+Audit access follows dashboard roles:
+
+- `system_admin` can see all audit logs.
+- `company_admin` can see only their company audit logs.
+- `viewer` can see only their company audit logs.
+
+Start the mock server:
+
+```powershell
+python .\mock_server.py
+```
+
+Login as system admin and verify the login audit appears:
+
+```text
+http://127.0.0.1:8008
+username: admin
+password: admin123
+```
+
+Enroll and start the agent in API mode:
+
+```powershell
+python .\agent_cli.py enroll-device --company "Ybalai Builders"
+python .\agent_cli.py set-mode api
+Stop-ScheduledTask -TaskName "Systemo Agent"
+Start-ScheduledTask -TaskName "Systemo Agent"
+```
+
+Wait 10-20 seconds, refresh the dashboard, and approve the pending device. The audit timeline should show device enrollment, first heartbeat, and device approval.
+
+Logout, then login as viewer:
+
+```text
+username: ybalai_viewer
+password: admin123
+```
+
+Create a `7zip install` app request and verify the audit timeline shows `APP_REQUEST_CREATED`. The viewer should not see approve/reject controls.
+
+Logout, then login as company admin:
+
+```text
+username: ybalai_admin
+password: admin123
+```
+
+Approve the request and verify the timeline shows `APP_REQUEST_APPROVED` and `JOB_CREATED`.
+
+Confirm the agent executes the job:
+
+```powershell
+Start-Sleep -Seconds 45
+python .\agent_cli.py api-list-jobs
+python .\agent_cli.py detect 7zip
+```
+
+Refresh the dashboard and verify the timeline shows `JOB_STARTED` and `JOB_SUCCESS` or `JOB_SKIPPED`.
+
+Test failed login auditing:
+
+```text
+Logout, then try username admin with password wrong-password.
+```
+
+Login again as `admin / admin123` and verify `USER_LOGIN_FAILED` appears.
+
+To verify role scoping, create or use another company/device, then compare the Audit Logs section:
+
+- `admin` should see all company audit logs.
+- `ybalai_admin` should see only `Ybalai Builders` audit logs.
+- `ybalai_viewer` should see only `Ybalai Builders` audit logs and has read-only access.
+
 To test VLC detection after uninstall:
 
 ```powershell
