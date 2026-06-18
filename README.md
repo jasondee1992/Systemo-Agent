@@ -509,6 +509,95 @@ password: admin123
 
 Verify the dashboard is read-only: no create job form and no approve/reject buttons. Agent job processing still works for approved jobs created by an admin.
 
+## Phase 10C App Request Approval Flow
+
+The dashboard now uses app requests as the default workflow. Viewers and company admins submit app requests, then a company admin or system admin approves or rejects them. Approved requests are converted into executable jobs for the agent.
+
+Request rules:
+
+- `system_admin` can view, create, approve, and reject requests for any company.
+- `company_admin` can view, create, approve, and reject requests for their own company only.
+- `viewer` can view and create requests for their own company only.
+- Viewers cannot approve or reject requests.
+- Existing CLI `api-add-job` still works for the prototype admin flow, but dashboard users should use app requests.
+
+Start the mock server:
+
+```powershell
+python .\mock_server.py
+```
+
+Make sure the agent is enrolled and running in API mode:
+
+```powershell
+python .\agent_cli.py enroll-device --company "Ybalai Builders"
+python .\agent_cli.py set-mode api
+Stop-ScheduledTask -TaskName "Systemo Agent"
+Start-ScheduledTask -TaskName "Systemo Agent"
+```
+
+Open the dashboard:
+
+```text
+http://127.0.0.1:8008
+```
+
+Login as viewer and create a 7-Zip install request:
+
+```text
+username: ybalai_viewer
+password: admin123
+```
+
+Use Create App Request:
+
+- Company: `ybalai-builders`
+- Device target: `any`
+- App: `7zip`
+- Action: `install`
+
+Verify the request is `pending` and that the viewer has no approve/reject buttons.
+
+Logout, then login as company admin:
+
+```text
+username: ybalai_admin
+password: admin123
+```
+
+Approve the pending request. The request should change to `converted_to_job` and show `linked_job_id`. Confirm the agent executes the install job:
+
+```powershell
+Start-Sleep -Seconds 45
+python .\agent_cli.py api-list-jobs
+python .\agent_cli.py detect 7zip
+```
+
+Create and approve a 7-Zip uninstall request from the dashboard, then confirm uninstall:
+
+```powershell
+Start-Sleep -Seconds 45
+python .\agent_cli.py api-list-jobs
+python .\agent_cli.py detect 7zip
+```
+
+Logout, then login as system admin:
+
+```text
+username: admin
+password: admin123
+```
+
+Verify all companies, requests, jobs, and devices are visible. Company admins and viewers remain restricted to their assigned company through protected dashboard APIs.
+
+Confirm the existing CLI direct job path still works if needed:
+
+```powershell
+python .\agent_cli.py api-add-job 7zip install
+Start-Sleep -Seconds 45
+python .\agent_cli.py api-list-jobs
+```
+
 To test VLC detection after uninstall:
 
 ```powershell

@@ -18,11 +18,13 @@ JOBS_FILE = BACKEND_DIR / "jobs.json"
 DEVICES_FILE = BACKEND_DIR / "devices.json"
 TENANTS_FILE = BACKEND_DIR / "tenants.json"
 USERS_FILE = BACKEND_DIR / "users.json"
+APP_REQUESTS_FILE = BACKEND_DIR / "app_requests.json"
 CATALOG_FILE = BASE_DIR / "app_catalog.json"
 ALLOWED_APPS = {"vlc", "chrome", "7zip"}
 ALLOWED_ACTIONS = {"install", "uninstall"}
 TENANT_STATUSES = {"active", "inactive"}
 USER_ROLES = {"system_admin", "company_admin", "viewer"}
+APP_REQUEST_STATUSES = {"pending", "approved", "rejected", "converted_to_job"}
 SESSION_COOKIE_NAME = "systemo_session"
 SESSIONS = {}
 
@@ -72,6 +74,20 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class CreateAppRequestRequest(BaseModel):
+    device_id: str = "any"
+    target_device_id: Optional[str] = None
+    company_id: Optional[str] = None
+    company_name: Optional[str] = None
+    app: str
+    action: str = "install"
+    reason: Optional[str] = None
+
+
+class AppRequestDecisionRequest(BaseModel):
+    reason: Optional[str] = None
+
+
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -111,6 +127,30 @@ def save_jobs(jobs):
         json.dump(jobs, file, indent=2)
         file.write("\n")
     temp_file.replace(JOBS_FILE)
+
+
+def load_app_requests():
+    BACKEND_DIR.mkdir(parents=True, exist_ok=True)
+    if not APP_REQUESTS_FILE.exists():
+        save_app_requests([])
+        return []
+
+    with APP_REQUESTS_FILE.open("r", encoding="utf-8") as file:
+        app_requests = json.load(file)
+
+    if not isinstance(app_requests, list):
+        raise HTTPException(status_code=500, detail="mock_backend/app_requests.json must contain an array")
+
+    return app_requests
+
+
+def save_app_requests(app_requests):
+    BACKEND_DIR.mkdir(parents=True, exist_ok=True)
+    temp_file = APP_REQUESTS_FILE.with_suffix(".json.tmp")
+    with temp_file.open("w", encoding="utf-8") as file:
+        json.dump(app_requests, file, indent=2)
+        file.write("\n")
+    temp_file.replace(APP_REQUESTS_FILE)
 
 
 def load_devices():
@@ -402,6 +442,16 @@ def filter_jobs_for_user(jobs, user):
     ]
 
 
+def filter_app_requests_for_user(app_requests, user):
+    if user.get("role") == "system_admin":
+        return app_requests
+    return [
+        app_request
+        for app_request in app_requests
+        if isinstance(app_request, dict) and app_request.get("company_id") == user.get("company_id")
+    ]
+
+
 def assert_company_access(user, company_id):
     if user.get("role") == "system_admin":
         return
@@ -417,6 +467,181 @@ def assert_can_manage_device(user, device):
 def assert_can_create_job(user, company_id):
     require_role(user, {"system_admin", "company_admin"})
     assert_company_access(user, company_id)
+
+
+def assert_can_create_app_request(user, company_id):
+    require_role(user, {"system_admin", "company_admin", "viewer"})
+    assert_company_access(user, company_id)
+
+
+def assert_can_decide_app_request(user, app_request):
+    require_role(user, {"system_admin", "company_admin"})
+    assert_company_access(user, app_request.get("company_id"))
+
+
+def resolve_target_from_payload(payload):
+    target_device_id = payload.target_device_id or payload.device_id or "any"
+    if target_device_id == "any":
+        return "any", "any_approved_device"
+    return target_device_id, "specific_device"
+
+
+def resolve_company_for_target(company_id=None, company_name=None, target_device_id="any"):
+    if target_device_id != "any":
+        target_device = get_device(target_device_id)
+        device_company_id = target_device.get("company_id")
+        if company_id and company_id != device_company_id:
+            raise HTTPException(status_code=400, detail="Target device does not belong to selected company")
+        return target_device.get("company_id"), target_device.get("company_name"), target_device
+
+    company = get_company_from_request(
+        company_id=company_id,
+        company_name=company_name,
+        create_if_missing=False,
+    )
+    return company.get("company_id"), company.get("company_name"), None
+
+
+def validate_app_request_target(company_id, target_device_id, require_approved_device=False):
+    if target_device_id == "any":
+        return
+
+    target_device = get_device(target_device_id)
+    if target_device.get("company_id") != company_id:
+        raise HTTPException(status_code=400, detail="Target device does not belong to request company")
+    if require_approved_device and target_device.get("approval_status") != "approved":
+        raise HTTPException(status_code=400, detail="Target device must be approved before a job can be created")
+
+
+def company_has_approved_device(company_id):
+    return any(
+        isinstance(device, dict)
+        and device.get("company_id") == company_id
+        and device.get("approval_status") == "approved"
+        for device in load_devices()
+    )
+
+
+def find_app_request(app_requests, request_id):
+    for app_request in app_requests:
+        if isinstance(app_request, dict) and app_request.get("request_id") == request_id:
+            return app_request
+    return None
+
+
+def create_app_request_record(payload, user):
+    if payload.app not in ALLOWED_APPS:
+        raise HTTPException(status_code=400, detail="Unsupported app")
+
+    if payload.action not in ALLOWED_ACTIONS:
+        raise HTTPException(status_code=400, detail="Unsupported action")
+
+    target_device_id, target_type = resolve_target_from_payload(payload)
+    requested_company_id = payload.company_id
+    requested_company_name = payload.company_name
+    if user.get("role") != "system_admin":
+        requested_company_id = user.get("company_id")
+        requested_company_name = None
+
+    if target_device_id != "any":
+        target_device = get_device(target_device_id)
+        company_id = target_device.get("company_id")
+        company_name = target_device.get("company_name")
+    else:
+        company_id, company_name, _ = resolve_company_for_target(
+            company_id=requested_company_id,
+            company_name=requested_company_name,
+            target_device_id=target_device_id,
+        )
+    assert_can_create_app_request(user, company_id)
+    validate_app_request_target(company_id, target_device_id, require_approved_device=False)
+
+    now = utc_now()
+    app_request = {
+        "request_id": f"req-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}",
+        "company_id": company_id,
+        "company_name": company_name,
+        "device_id": None if target_device_id == "any" else target_device_id,
+        "target_device_id": target_device_id,
+        "target_type": target_type,
+        "app": payload.app,
+        "action": payload.action,
+        "requested_by_user_id": user.get("user_id"),
+        "requested_by_username": user.get("username"),
+        "status": "pending",
+        "approved_by_user_id": None,
+        "approved_by_username": None,
+        "rejected_by_user_id": None,
+        "rejected_by_username": None,
+        "linked_job_id": None,
+        "reason": payload.reason,
+        "created_at": now,
+        "updated_at": now,
+    }
+    app_requests = load_app_requests()
+    app_requests.append(app_request)
+    save_app_requests(app_requests)
+    return app_request
+
+
+def approve_app_request_record(request_id, user, decision):
+    app_requests = load_app_requests()
+    app_request = find_app_request(app_requests, request_id)
+    if app_request is None:
+        raise HTTPException(status_code=404, detail="App request not found")
+
+    assert_can_decide_app_request(user, app_request)
+    if app_request.get("status") != "pending":
+        raise HTTPException(status_code=400, detail="Only pending app requests can be approved")
+
+    company_id = app_request.get("company_id")
+    target_device_id = app_request.get("target_device_id") or "any"
+    validate_app_request_target(company_id, target_device_id, require_approved_device=True)
+    if target_device_id == "any" and not company_has_approved_device(company_id):
+        raise HTTPException(status_code=400, detail="Company must have at least one approved device")
+
+    job = create_executable_job(
+        app=app_request.get("app"),
+        action=app_request.get("action"),
+        device_id="any" if target_device_id == "any" else target_device_id,
+        company_id=company_id,
+        company_name=app_request.get("company_name"),
+        created_by_user_id=app_request.get("requested_by_user_id"),
+        created_by_username=app_request.get("requested_by_username"),
+        approved_by_user_id=user.get("user_id"),
+        approved_by_username=user.get("username"),
+        source_request_id=app_request.get("request_id"),
+    )
+
+    app_request["status"] = "converted_to_job"
+    app_request["approved_by_user_id"] = user.get("user_id")
+    app_request["approved_by_username"] = user.get("username")
+    app_request["linked_job_id"] = job.get("id")
+    if decision.reason:
+        app_request["reason"] = decision.reason
+    app_request["updated_at"] = utc_now()
+    save_app_requests(app_requests)
+    return app_request
+
+
+def reject_app_request_record(request_id, user, decision):
+    app_requests = load_app_requests()
+    app_request = find_app_request(app_requests, request_id)
+    if app_request is None:
+        raise HTTPException(status_code=404, detail="App request not found")
+
+    assert_can_decide_app_request(user, app_request)
+    if app_request.get("status") != "pending":
+        raise HTTPException(status_code=400, detail="Only pending app requests can be rejected")
+
+    app_request["status"] = "rejected"
+    app_request["rejected_by_user_id"] = user.get("user_id")
+    app_request["rejected_by_username"] = user.get("username")
+    if decision.reason:
+        app_request["reason"] = decision.reason
+    app_request["updated_at"] = utc_now()
+    save_app_requests(app_requests)
+    return app_request
 
 
 def validate_tenant_status(status):
@@ -783,16 +1008,23 @@ def get_dashboard_html():
     }
 
     .status.failed,
-    .status.requires_user_action {
+    .status.requires_user_action,
+    .status.rejected {
       background: #fff0ed;
       color: var(--danger);
     }
 
     .status.approved,
     .status.installing,
-    .status.uninstalling {
+    .status.uninstalling,
+    .status.pending {
       background: #fff7e8;
       color: var(--warn);
+    }
+
+    .status.converted_to_job {
+      background: #e8f5ee;
+      color: var(--ok);
     }
 
     .empty {
@@ -849,11 +1081,11 @@ def get_dashboard_html():
       <div id="companiesTable" class="table-wrap"></div>
     </section>
 
-    <section id="jobSection">
+    <section id="requestSection">
       <div class="section-header">
-        <h2>Create Job</h2>
+        <h2>Create App Request</h2>
       </div>
-      <form id="jobForm" class="actions">
+      <form id="requestForm" class="actions">
         <label>
           Company
           <select id="companySelect" name="company_id"></select>
@@ -870,7 +1102,7 @@ def get_dashboard_html():
           Action
           <select id="actionSelect" name="action"></select>
         </label>
-        <button type="submit">Create Job</button>
+        <button type="submit">Create Request</button>
       </form>
       <div id="formMessage" class="message"></div>
     </section>
@@ -884,7 +1116,14 @@ def get_dashboard_html():
 
     <section>
       <div class="section-header">
-        <h2>Jobs</h2>
+        <h2>App Requests</h2>
+      </div>
+      <div id="requestsTable" class="table-wrap"></div>
+    </section>
+
+    <section>
+      <div class="section-header">
+        <h2>Executable Jobs</h2>
       </div>
       <div id="jobsTable" class="table-wrap"></div>
     </section>
@@ -893,6 +1132,7 @@ def get_dashboard_html():
   <script>
     const companyFields = ["company_id", "company_name", "created_at", "updated_at"];
     const deviceFields = ["company_name", "hostname", "username", "os", "agent_version", "connection_status", "approval_status", "last_seen_at"];
+    const requestFields = ["request_id", "company_name", "target_device_id", "app", "action", "requested_by_username", "status", "linked_job_id", "created_at"];
     const jobFields = ["id", "company_name", "device_id", "app", "action", "status", "attempts", "message", "started_at", "finished_at"];
     const preferredApps = ["7zip", "vlc", "chrome"];
     let currentUser = null;
@@ -970,6 +1210,30 @@ def get_dashboard_html():
       target.innerHTML = `<table><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>`;
     }
 
+    function renderRequests(rows) {
+      const target = document.getElementById("requestsTable");
+      if (!rows.length) {
+        target.innerHTML = '<div class="empty">No records found.</div>';
+        return;
+      }
+
+      const showActions = currentUser && currentUser.role !== "viewer";
+      const columns = showActions ? [...requestFields, "actions"] : requestFields;
+      const header = columns.map((field) => `<th>${escapeHtml(field)}</th>`).join("");
+      const body = rows.map((row) => {
+        const cells = requestFields.map((field) => {
+          const value = row[field];
+          return `<td>${field === "status" ? statusCell(value) : escapeHtml(value)}</td>`;
+        }).join("");
+        const isPending = row.status === "pending";
+        const actions = isPending
+          ? `<button class="small" type="button" data-request-approve="${escapeHtml(row.request_id)}">Approve</button> <button class="small secondary" type="button" data-request-reject="${escapeHtml(row.request_id)}">Reject</button>`
+          : "-";
+        return showActions ? `<tr>${cells}<td>${actions}</td></tr>` : `<tr>${cells}</tr>`;
+      }).join("");
+      target.innerHTML = `<table><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>`;
+    }
+
     function populateSelect(selectId, values) {
       const select = document.getElementById(selectId);
       const currentValue = select.value;
@@ -1004,17 +1268,18 @@ def get_dashboard_html():
       }
       document.getElementById("userInfo").textContent = `${currentUser.username} (${currentUser.role})`;
       document.getElementById("companyForm").style.display = currentUser.role === "system_admin" ? "" : "none";
-      document.getElementById("jobSection").style.display = currentUser.role === "viewer" ? "none" : "";
+      document.getElementById("requestSection").style.display = "";
       document.getElementById("companySelect").disabled = currentUser.role !== "system_admin";
     }
 
     async function refreshAll() {
       try {
-        const [session, health, companies, devices, jobs, catalog] = await Promise.all([
+        const [session, health, companies, devices, requests, jobs, catalog] = await Promise.all([
           fetchJson("/dashboard/api/session"),
           fetchJson("/health"),
           fetchJson("/dashboard/api/companies"),
           fetchJson("/dashboard/api/devices"),
+          fetchJson("/api/app-requests"),
           fetchJson("/dashboard/api/jobs"),
           fetchJson("/dashboard/api/catalog"),
         ]);
@@ -1028,6 +1293,7 @@ def get_dashboard_html():
         refreshFormOptions();
         renderTable("companiesTable", companyFields, lastCompanies);
         renderDevices(lastDevices);
+        renderRequests(Array.isArray(requests) ? [...requests].reverse() : []);
         renderTable("jobsTable", jobFields, Array.isArray(jobs) ? [...jobs].reverse() : []);
       } catch (error) {
         setHealth(false, "Backend unavailable");
@@ -1058,7 +1324,7 @@ def get_dashboard_html():
       }
     }
 
-    async function createJob(event) {
+    async function createAppRequest(event) {
       event.preventDefault();
       const message = document.getElementById("formMessage");
       message.textContent = "";
@@ -1072,16 +1338,30 @@ def get_dashboard_html():
       };
 
       try {
-        const job = await fetchJson("/dashboard/api/jobs", {
+        const appRequest = await fetchJson("/api/app-requests", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
-        message.textContent = `Created job ${job.id}`;
+        message.textContent = `Created app request ${appRequest.request_id}`;
         await refreshAll();
       } catch (error) {
         message.textContent = error.message;
         message.className = "message error";
+      }
+    }
+
+    async function updateRequestApproval(requestId, decision) {
+      try {
+        await fetchJson(`/api/app-requests/${encodeURIComponent(requestId)}/${decision}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        });
+        await refreshAll();
+      } catch (error) {
+        document.getElementById("formMessage").textContent = error.message;
+        document.getElementById("formMessage").className = "message error";
       }
     }
 
@@ -1102,7 +1382,7 @@ def get_dashboard_html():
     });
     document.getElementById("companySelect").addEventListener("change", refreshFormOptions);
     document.getElementById("companyForm").addEventListener("submit", createCompany);
-    document.getElementById("jobForm").addEventListener("submit", createJob);
+    document.getElementById("requestForm").addEventListener("submit", createAppRequest);
     document.getElementById("devicesTable").addEventListener("click", (event) => {
       const approveId = event.target.getAttribute("data-approve");
       const rejectId = event.target.getAttribute("data-reject");
@@ -1111,6 +1391,16 @@ def get_dashboard_html():
       }
       if (rejectId) {
         updateDeviceApproval(rejectId, "reject");
+      }
+    });
+    document.getElementById("requestsTable").addEventListener("click", (event) => {
+      const approveId = event.target.getAttribute("data-request-approve");
+      const rejectId = event.target.getAttribute("data-request-reject");
+      if (approveId) {
+        updateRequestApproval(approveId, "approve");
+      }
+      if (rejectId) {
+        updateRequestApproval(rejectId, "reject");
       }
     });
     refreshAll();
@@ -1207,18 +1497,52 @@ def dashboard_jobs(request: Request):
 @app.post("/dashboard/api/jobs")
 def dashboard_create_job(request: Request, payload: CreateJobRequest):
     user = get_current_user(request)
+    require_role(user, {"system_admin"})
     if payload.device_id != "any":
         target_device = get_device(payload.device_id)
         company_id = target_device.get("company_id")
     else:
         company_id = payload.company_id or user.get("company_id")
-    if user.get("role") != "system_admin":
-        payload.company_id = user.get("company_id")
-        payload.company_name = None
     if not company_id:
         raise HTTPException(status_code=400, detail="company_id is required")
     assert_can_create_job(user, company_id)
     return create_job(payload)
+
+
+@app.post("/api/app-requests")
+def create_app_request(request: Request, payload: CreateAppRequestRequest):
+    user = get_current_user(request)
+    return create_app_request_record(payload, user)
+
+
+@app.get("/api/app-requests")
+def get_app_requests(request: Request):
+    user = get_current_user(request)
+    return filter_app_requests_for_user(load_app_requests(), user)
+
+
+@app.post("/api/app-requests/{request_id}/approve")
+def approve_app_request(
+    request: Request,
+    request_id: str,
+    decision: Optional[AppRequestDecisionRequest] = None,
+):
+    user = get_current_user(request)
+    if decision is None:
+        decision = AppRequestDecisionRequest()
+    return approve_app_request_record(request_id, user, decision)
+
+
+@app.post("/api/app-requests/{request_id}/reject")
+def reject_app_request(
+    request: Request,
+    request_id: str,
+    decision: Optional[AppRequestDecisionRequest] = None,
+):
+    user = get_current_user(request)
+    if decision is None:
+        decision = AppRequestDecisionRequest()
+    return reject_app_request_record(request_id, user, decision)
 
 
 @app.get("/health")
@@ -1358,15 +1682,41 @@ def create_job(request: CreateJobRequest):
     if not company_id:
         raise HTTPException(status_code=400, detail="Job company could not be resolved")
 
+    return create_executable_job(
+        app=request.app,
+        action=request.action,
+        device_id=request.device_id,
+        company_id=company_id,
+        company_name=company_name,
+    )
+
+
+def create_executable_job(
+    app,
+    action,
+    device_id,
+    company_id,
+    company_name,
+    created_by_user_id=None,
+    created_by_username=None,
+    approved_by_user_id=None,
+    approved_by_username=None,
+    source_request_id=None,
+):
     jobs = load_jobs()
     job = {
         "id": f"job-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}",
         "company_id": company_id,
         "company_name": company_name,
-        "device_id": request.device_id,
-        "app": request.app,
-        "action": request.action,
+        "device_id": device_id,
+        "app": app,
+        "action": action,
         "status": "approved",
+        "created_by_user_id": created_by_user_id,
+        "created_by_username": created_by_username,
+        "approved_by_user_id": approved_by_user_id,
+        "approved_by_username": approved_by_username,
+        "source_request_id": source_request_id,
         "created_at": utc_now(),
         "started_at": None,
         "finished_at": None,
