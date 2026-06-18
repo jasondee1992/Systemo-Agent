@@ -870,6 +870,123 @@ Installer troubleshooting:
 - If health is stale, run `Get-ScheduledTaskInfo -TaskName "Systemo Agent"` and check `logs/task-runner.log` and `logs/agent.log`.
 - If jobs do not execute, confirm `python .\agent_cli.py health` shows API mode, the expected API URL, an approved device, and a running scheduled task.
 
+## Phase 13 App Catalog Management
+
+Approved apps are now stored in the SQLite database instead of being hardcoded in the mock backend. API jobs created from app requests or direct API job commands include an app catalog snapshot:
+
+- `app_key`
+- `display_name`
+- `winget_id`
+- `detection_id`
+
+The agent uses that snapshot for API jobs and keeps `app_catalog.json` as the local-mode and backward-compatibility fallback.
+
+Default global catalog entries are seeded once:
+
+- `7zip` / `7-Zip` / `7zip.7zip`
+- `vlc` / `VLC Media Player` / `VideoLAN.VLC`
+- `chrome` / `Google Chrome` / `Google.Chrome`
+
+Start the mock server:
+
+```powershell
+python .\mock_server.py
+```
+
+Open the dashboard:
+
+```text
+http://127.0.0.1:8008
+```
+
+App catalog visibility test:
+
+1. Login as `admin / admin123`.
+2. Confirm the App Catalog section shows `7zip`, `vlc`, and `chrome`.
+3. Stop and restart `mock_server.py`.
+4. Confirm the same three default entries appear without duplicates.
+
+App request using catalog:
+
+1. Login as `ybalai_viewer / admin123`.
+2. Create a `7zip install` app request from the app dropdown.
+3. Login as `ybalai_admin / admin123`.
+4. Approve the request.
+5. Verify the created job includes `app_key`, `display_name`, `winget_id`, and `detection_id`:
+
+```powershell
+python .\agent_cli.py api-list-jobs
+```
+
+6. Verify install:
+
+```powershell
+Start-Sleep -Seconds 45
+python .\agent_cli.py detect 7zip
+```
+
+Then create and approve a `7zip uninstall` request and verify uninstall:
+
+```powershell
+Start-Sleep -Seconds 45
+python .\agent_cli.py api-list-jobs
+python .\agent_cli.py detect 7zip
+```
+
+Disabled app test:
+
+1. Login as `admin / admin123`.
+2. In App Catalog, disable `7zip`.
+3. Login as `ybalai_viewer / admin123`.
+4. Confirm `7zip` no longer appears in the request app dropdown.
+5. Confirm the API rejects a disabled direct job:
+
+```powershell
+python .\agent_cli.py api-add-job 7zip install
+```
+
+Expected: clear validation error.
+
+6. Login as admin and enable `7zip` again.
+7. Confirm requests and jobs work again.
+
+Invalid app test:
+
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8008/api/agent/jobs `
+  -ContentType "application/json" `
+  -Body '{"company_id":"ybalai-builders","device_id":"any","app":"fake-app","action":"install"}'
+```
+
+Expected: the API rejects the app and no executable job is created.
+
+Role test:
+
+- `viewer` can view enabled available apps only.
+- `viewer` cannot create, edit, enable, or disable app catalog entries.
+- `company_admin` can view global and own-company catalog entries but cannot edit global catalog entries in this prototype.
+- `system_admin` can create, edit, enable, and disable catalog entries.
+
+Catalog API endpoints:
+
+```text
+GET /api/app-catalog
+POST /api/app-catalog
+PATCH /api/app-catalog/{app_id}
+PUT /api/app-catalog/{app_id}
+POST /api/app-catalog/{app_id}/enable
+POST /api/app-catalog/{app_id}/disable
+```
+
+Catalog changes are audited with:
+
+- `APP_CATALOG_CREATED`
+- `APP_CATALOG_UPDATED`
+- `APP_CATALOG_ENABLED`
+- `APP_CATALOG_DISABLED`
+- `APP_CATALOG_VALIDATION_FAILED`
+
 To test VLC detection after uninstall:
 
 ```powershell

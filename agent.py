@@ -248,6 +248,31 @@ def get_catalog_command(catalog, app, action):
     return ["winget", action, "--id", winget_id, *action_args]
 
 
+def build_catalog_for_job(catalog, job):
+    app = job.get("app") or job.get("app_key")
+    if not app:
+        return catalog
+
+    winget_id = job.get("winget_id")
+    detection_id = job.get("detection_id")
+    if not winget_id and not detection_id:
+        return catalog
+
+    runtime_catalog = dict(catalog)
+    app_entry = dict(runtime_catalog.get(app, {}))
+    app_entry["display_name"] = job.get("display_name") or app_entry.get("display_name") or app
+    app_entry["winget_id"] = winget_id or app_entry.get("winget_id")
+    app_entry["detection_method"] = "winget"
+    app_entry["detection_id"] = detection_id or app_entry.get("detection_id") or winget_id
+    app_entry.setdefault("install_args", ["--silent", "--accept-package-agreements", "--accept-source-agreements"])
+    app_entry.setdefault(
+        "uninstall_args",
+        ["--exact", "--silent", "--disable-interactivity", "--accept-source-agreements"],
+    )
+    runtime_catalog[app] = app_entry
+    return runtime_catalog
+
+
 def get_detection_command(catalog, app):
     app_entry = catalog.get(app)
     if not isinstance(app_entry, dict):
@@ -278,9 +303,9 @@ def sanitize_output_preview(output, max_length=500):
     return preview
 
 
-def detect_app_installation(app_key):
+def detect_app_installation(app_key, catalog_override=None):
     setup_logging()
-    catalog = load_catalog()
+    catalog = catalog_override or load_catalog()
     command = get_detection_command(catalog, app_key)
     if command is None:
         LOGGER.warning("Detection failed for %s: no approved detection command", app_key)
@@ -339,8 +364,8 @@ def detect_app_installation(app_key):
     }
 
 
-def is_app_installed(app_key):
-    return detect_app_installation(app_key)["installed"]
+def is_app_installed(app_key, catalog_override=None):
+    return detect_app_installation(app_key, catalog_override)["installed"]
 
 
 def validate_job(job, catalog):
@@ -434,6 +459,7 @@ def process_job_record(job, catalog, expected_status, save_state=None):
 
     app = job.get("app")
     action = job.get("action")
+    catalog = build_catalog_for_job(catalog, job)
     job["attempts"] = get_next_attempt_count(job)
     job["started_at"] = utc_now()
     job["finished_at"] = None
@@ -452,7 +478,7 @@ def process_job_record(job, catalog, expected_status, save_state=None):
         return job
 
     command = get_catalog_command(catalog, app, action)
-    installed = is_app_installed(app)
+    installed = is_app_installed(app, catalog)
 
     if action == "install" and installed:
         job["status"] = "skipped"

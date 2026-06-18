@@ -24,6 +24,32 @@ def init_database():
     import models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
+    apply_safe_migrations()
+
+
+def apply_safe_migrations():
+    migrations = {
+        "jobs": {
+            "app_key": "VARCHAR",
+            "display_name": "VARCHAR",
+            "winget_id": "VARCHAR",
+            "detection_id": "VARCHAR",
+        },
+    }
+
+    with engine.begin() as connection:
+        for table_name, columns in migrations.items():
+            existing_columns = {
+                row[1]
+                for row in connection.exec_driver_sql(f"PRAGMA table_info({table_name})").fetchall()
+            }
+            if not existing_columns:
+                continue
+            for column_name, column_type in columns.items():
+                if column_name not in existing_columns:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
+                    )
 
 
 @contextmanager

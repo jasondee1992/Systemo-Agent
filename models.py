@@ -1,6 +1,6 @@
 import json
 
-from sqlalchemy import Integer, String, Text
+from sqlalchemy import Boolean, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from database import Base
@@ -143,6 +143,10 @@ class Job(Base):
     company_name: Mapped[str] = mapped_column(String, nullable=False)
     device_id: Mapped[str] = mapped_column(String, nullable=False, default="any")
     app: Mapped[str] = mapped_column(String, nullable=False)
+    app_key: Mapped[str | None] = mapped_column(String, nullable=True)
+    display_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    winget_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    detection_id: Mapped[str | None] = mapped_column(String, nullable=True)
     action: Mapped[str] = mapped_column(String, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -168,6 +172,10 @@ class Job(Base):
             "company_name": self.company_name,
             "device_id": self.device_id,
             "app": self.app,
+            "app_key": self.app_key or self.app,
+            "display_name": self.display_name,
+            "winget_id": self.winget_id,
+            "detection_id": self.detection_id,
             "action": self.action,
             "status": self.status,
             "attempts": self.attempts,
@@ -183,6 +191,60 @@ class Job(Base):
             "finished_at": self.finished_at,
             "audit_started_at": self.audit_started_at,
             "audit_result_status": self.audit_result_status,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+
+class AppCatalog(Base):
+    __tablename__ = "app_catalog"
+
+    app_id: Mapped[str] = mapped_column(String, primary_key=True)
+    display_name: Mapped[str] = mapped_column(String, nullable=False)
+    app_key: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    winget_id: Mapped[str] = mapped_column(String, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    supported_actions_json: Mapped[str] = mapped_column(Text, nullable=False)
+    install_command_template: Mapped[str | None] = mapped_column(Text, nullable=True)
+    uninstall_command_template: Mapped[str | None] = mapped_column(Text, nullable=True)
+    detection_method: Mapped[str] = mapped_column(String, nullable=False, default="winget")
+    detection_id: Mapped[str] = mapped_column(String, nullable=False)
+    silent_install_supported: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    silent_uninstall_supported: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    scope: Mapped[str] = mapped_column(String, nullable=False, default="global")
+    company_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_by_user_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_by_username: Mapped[str | None] = mapped_column(String, nullable=True)
+    created_at: Mapped[str] = mapped_column(String, nullable=False)
+    updated_at: Mapped[str] = mapped_column(String, nullable=False)
+
+    def to_dict(self):
+        try:
+            supported_actions = json.loads(self.supported_actions_json)
+        except json.JSONDecodeError:
+            supported_actions = []
+        if not isinstance(supported_actions, list):
+            supported_actions = []
+
+        return {
+            "app_id": self.app_id,
+            "display_name": self.display_name,
+            "app_key": self.app_key,
+            "winget_id": self.winget_id,
+            "description": self.description,
+            "supported_actions": supported_actions,
+            "install_command_template": self.install_command_template,
+            "uninstall_command_template": self.uninstall_command_template,
+            "detection_method": self.detection_method,
+            "detection_id": self.detection_id,
+            "silent_install_supported": self.silent_install_supported,
+            "silent_uninstall_supported": self.silent_uninstall_supported,
+            "enabled": self.enabled,
+            "scope": self.scope,
+            "company_id": self.company_id,
+            "created_by_user_id": self.created_by_user_id,
+            "created_by_username": self.created_by_username,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }

@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 from database import init_database, session_scope
-from models import AppRequest, AuditLog, Company, Device, Job, User
+from models import AppCatalog, AppRequest, AuditLog, Company, Device, Job, User
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -93,12 +93,93 @@ class AppRequestDecisionRequest(BaseModel):
     reason: Optional[str] = None
 
 
+class CreateAppCatalogRequest(BaseModel):
+    app_key: str
+    display_name: str
+    winget_id: str
+    description: Optional[str] = None
+    supported_actions: list[str] = ["install", "uninstall"]
+    install_command_template: Optional[str] = None
+    uninstall_command_template: Optional[str] = None
+    detection_method: str = "winget"
+    detection_id: Optional[str] = None
+    silent_install_supported: bool = True
+    silent_uninstall_supported: bool = True
+    enabled: bool = True
+    scope: str = "global"
+    company_id: Optional[str] = None
+
+
+class UpdateAppCatalogRequest(BaseModel):
+    display_name: Optional[str] = None
+    winget_id: Optional[str] = None
+    description: Optional[str] = None
+    supported_actions: Optional[list[str]] = None
+    install_command_template: Optional[str] = None
+    uninstall_command_template: Optional[str] = None
+    detection_method: Optional[str] = None
+    detection_id: Optional[str] = None
+    silent_install_supported: Optional[bool] = None
+    silent_uninstall_supported: Optional[bool] = None
+    enabled: Optional[bool] = None
+    scope: Optional[str] = None
+    company_id: Optional[str] = None
+
+
 AUDIT_JOB_RESULT_EVENTS = {
     "success": "JOB_SUCCESS",
     "failed": "JOB_FAILED",
     "requires_user_action": "JOB_FAILED",
     "skipped": "JOB_SKIPPED",
 }
+
+DEFAULT_APP_CATALOG = [
+    {
+        "app_id": "global-7zip",
+        "display_name": "7-Zip",
+        "app_key": "7zip",
+        "winget_id": "7zip.7zip",
+        "description": "File archiver",
+        "supported_actions": ["install", "uninstall"],
+        "detection_method": "winget",
+        "detection_id": "7zip.7zip",
+        "silent_install_supported": True,
+        "silent_uninstall_supported": True,
+        "enabled": True,
+        "scope": "global",
+        "company_id": None,
+    },
+    {
+        "app_id": "global-vlc",
+        "display_name": "VLC Media Player",
+        "app_key": "vlc",
+        "winget_id": "VideoLAN.VLC",
+        "description": "Media player",
+        "supported_actions": ["install", "uninstall"],
+        "detection_method": "winget",
+        "detection_id": "VideoLAN.VLC",
+        "silent_install_supported": True,
+        "silent_uninstall_supported": False,
+        "enabled": True,
+        "scope": "global",
+        "company_id": None,
+    },
+    {
+        "app_id": "global-chrome",
+        "display_name": "Google Chrome",
+        "app_key": "chrome",
+        "winget_id": "Google.Chrome",
+        "description": "Web browser",
+        "supported_actions": ["install", "uninstall"],
+        "detection_method": "winget",
+        "detection_id": "Google.Chrome",
+        "silent_install_supported": True,
+        "silent_uninstall_supported": True,
+        "enabled": True,
+        "scope": "global",
+        "company_id": None,
+    },
+]
 
 
 def utc_now():
@@ -116,6 +197,319 @@ def load_catalog():
         raise HTTPException(status_code=500, detail="app_catalog.json must contain an object")
 
     return catalog
+
+
+def normalize_app_key(app_key):
+    normalized_key = (app_key or "").strip().lower()
+    normalized_key = re.sub(r"[^a-z0-9]+", "-", normalized_key).strip("-")
+    if not normalized_key:
+        raise HTTPException(status_code=400, detail="app_key is required")
+    return normalized_key
+
+
+def validate_catalog_scope(scope):
+    if scope not in {"global", "company"}:
+        raise HTTPException(status_code=400, detail="scope must be global or company")
+    return scope
+
+
+def validate_supported_actions(supported_actions):
+    if not isinstance(supported_actions, list) or not supported_actions:
+        raise HTTPException(status_code=400, detail="supported_actions must include install and/or uninstall")
+    normalized_actions = []
+    for action in supported_actions:
+        if action not in ALLOWED_ACTIONS:
+            raise HTTPException(status_code=400, detail=f"Unsupported action: {action}")
+        if action not in normalized_actions:
+            normalized_actions.append(action)
+    return normalized_actions
+
+
+def app_catalog_to_agent_snapshot(app_catalog_entry):
+    return {
+        "app_key": app_catalog_entry.get("app_key"),
+        "display_name": app_catalog_entry.get("display_name"),
+        "winget_id": app_catalog_entry.get("winget_id"),
+        "detection_id": app_catalog_entry.get("detection_id"),
+        "detection_method": app_catalog_entry.get("detection_method") or "winget",
+    }
+
+
+def load_app_catalog_entries():
+    with session_scope() as session:
+        return [
+            app_entry.to_dict()
+            for app_entry in session.query(AppCatalog).order_by(AppCatalog.display_name.asc()).all()
+        ]
+
+
+def save_app_catalog_entries(entries):
+    if not isinstance(entries, list):
+        raise HTTPException(status_code=500, detail="app_catalog entries must contain an array")
+
+    now = utc_now()
+    incoming_ids = {
+        entry.get("app_id")
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("app_id")
+    }
+    with session_scope() as session:
+        for existing_entry in session.query(AppCatalog).all():
+            if existing_entry.app_id not in incoming_ids:
+                session.delete(existing_entry)
+
+        for entry in entries:
+            if not isinstance(entry, dict) or not entry.get("app_id"):
+                continue
+            row = session.get(AppCatalog, entry.get("app_id"))
+            if row is None:
+                row = AppCatalog(
+                    app_id=entry.get("app_id"),
+                    app_key=normalize_app_key(entry.get("app_key")),
+                    display_name=entry.get("display_name"),
+                    winget_id=entry.get("winget_id"),
+                    supported_actions_json=json.dumps(validate_supported_actions(entry.get("supported_actions"))),
+                    detection_id=entry.get("detection_id") or entry.get("winget_id"),
+                    created_at=entry.get("created_at") or now,
+                    updated_at=entry.get("updated_at") or now,
+                )
+                session.add(row)
+
+            row.app_key = normalize_app_key(entry.get("app_key"))
+            row.display_name = entry.get("display_name")
+            row.winget_id = entry.get("winget_id")
+            row.description = entry.get("description")
+            row.supported_actions_json = json.dumps(validate_supported_actions(entry.get("supported_actions")))
+            row.install_command_template = entry.get("install_command_template")
+            row.uninstall_command_template = entry.get("uninstall_command_template")
+            row.detection_method = entry.get("detection_method") or "winget"
+            row.detection_id = entry.get("detection_id") or entry.get("winget_id")
+            row.silent_install_supported = bool(entry.get("silent_install_supported", True))
+            row.silent_uninstall_supported = bool(entry.get("silent_uninstall_supported", True))
+            row.enabled = bool(entry.get("enabled", True))
+            row.scope = validate_catalog_scope(entry.get("scope") or "global")
+            row.company_id = entry.get("company_id") if row.scope == "company" else None
+            row.created_by_user_id = entry.get("created_by_user_id")
+            row.created_by_username = entry.get("created_by_username")
+            row.created_at = entry.get("created_at") or row.created_at or now
+            row.updated_at = entry.get("updated_at") or now
+
+
+def seed_default_app_catalog():
+    with session_scope() as session:
+        existing_count = session.query(AppCatalog).count()
+    if existing_count:
+        return
+
+    now = utc_now()
+    entries = []
+    for entry in DEFAULT_APP_CATALOG:
+        entries.append(
+            {
+                **entry,
+                "created_at": now,
+                "updated_at": now,
+                "created_by_user_id": None,
+                "created_by_username": None,
+            }
+        )
+    save_app_catalog_entries(entries)
+
+
+def catalog_entry_visible_to_user(entry, user):
+    if entry.get("scope") == "global":
+        return True
+    if user.get("role") == "system_admin":
+        return True
+    return entry.get("company_id") == user.get("company_id")
+
+
+def filter_catalog_for_user(entries, user, enabled_only=False):
+    return [
+        entry
+        for entry in entries
+        if isinstance(entry, dict)
+        and catalog_entry_visible_to_user(entry, user)
+        and (not enabled_only or entry.get("enabled"))
+    ]
+
+
+def find_catalog_entry(app_id):
+    for entry in load_app_catalog_entries():
+        if isinstance(entry, dict) and entry.get("app_id") == app_id:
+            return entry
+    raise HTTPException(status_code=404, detail="App catalog entry not found")
+
+
+def get_available_catalog_entry(app_key, action, company_id=None, user=None):
+    normalized_key = normalize_app_key(app_key)
+    entries = load_app_catalog_entries()
+    if user is not None:
+        entries = filter_catalog_for_user(entries, user, enabled_only=True)
+    else:
+        entries = [
+            entry
+            for entry in entries
+            if isinstance(entry, dict)
+            and entry.get("enabled")
+            and (entry.get("scope") == "global" or entry.get("company_id") == company_id)
+        ]
+
+    matching_entries = [
+        entry
+        for entry in entries
+        if entry.get("app_key") == normalized_key
+        and action in (entry.get("supported_actions") or [])
+    ]
+    matching_entries.sort(key=lambda entry: 0 if entry.get("company_id") == company_id else 1)
+    if not matching_entries:
+        log_audit(
+            "APP_CATALOG_VALIDATION_FAILED",
+            f"App catalog validation failed for {normalized_key} {action}",
+            company_id=company_id,
+            actor=user,
+            target_type="app_catalog",
+            target_label=normalized_key,
+            metadata={"app": normalized_key, "action": action},
+        )
+        raise HTTPException(status_code=400, detail="App is not enabled or action is not allowed")
+    return matching_entries[0]
+
+
+def assert_can_manage_app_catalog(user, entry=None):
+    require_role(user, {"system_admin"})
+
+
+def build_catalog_entry_from_payload(payload, user):
+    scope = validate_catalog_scope(payload.scope or "global")
+    company_id = payload.company_id if scope == "company" else None
+    if scope == "company":
+        if not company_id:
+            raise HTTPException(status_code=400, detail="company_id is required for company-scoped apps")
+        get_company(company_id)
+
+    app_key = normalize_app_key(payload.app_key)
+    app_id = f"global-{app_key}" if scope == "global" else f"company-{company_id}-{app_key}"
+    return {
+        "app_id": app_id,
+        "display_name": payload.display_name,
+        "app_key": app_key,
+        "winget_id": payload.winget_id,
+        "description": payload.description,
+        "supported_actions": validate_supported_actions(payload.supported_actions),
+        "install_command_template": payload.install_command_template,
+        "uninstall_command_template": payload.uninstall_command_template,
+        "detection_method": payload.detection_method or "winget",
+        "detection_id": payload.detection_id or payload.winget_id,
+        "silent_install_supported": payload.silent_install_supported,
+        "silent_uninstall_supported": payload.silent_uninstall_supported,
+        "enabled": payload.enabled,
+        "scope": scope,
+        "company_id": company_id,
+        "created_by_user_id": user.get("user_id"),
+        "created_by_username": user.get("username"),
+        "created_at": utc_now(),
+        "updated_at": utc_now(),
+    }
+
+
+def create_app_catalog_entry(payload, user):
+    assert_can_manage_app_catalog(user)
+    entry = build_catalog_entry_from_payload(payload, user)
+    entries = load_app_catalog_entries()
+    if any(existing.get("app_key") == entry.get("app_key") for existing in entries):
+        raise HTTPException(status_code=400, detail="app_key already exists")
+    entries.append(entry)
+    save_app_catalog_entries(entries)
+    log_audit(
+        "APP_CATALOG_CREATED",
+        f"App catalog entry created for {entry.get('display_name')}",
+        company_id=entry.get("company_id"),
+        actor=user,
+        target_type="app_catalog",
+        target_label=entry.get("app_key"),
+        metadata={"app_id": entry.get("app_id"), "scope": entry.get("scope")},
+    )
+    return entry
+
+
+def update_app_catalog_entry(app_id, payload, user):
+    entries = load_app_catalog_entries()
+    entry = None
+    for candidate in entries:
+        if candidate.get("app_id") == app_id:
+            entry = candidate
+            break
+    if entry is None:
+        raise HTTPException(status_code=404, detail="App catalog entry not found")
+    assert_can_manage_app_catalog(user, entry)
+
+    update = payload.dict(exclude_unset=True)
+    if "app_key" in update:
+        raise HTTPException(status_code=400, detail="app_key cannot be changed")
+    if "scope" in update:
+        entry["scope"] = validate_catalog_scope(update["scope"])
+    if entry.get("scope") == "company":
+        company_id = update.get("company_id", entry.get("company_id"))
+        if not company_id:
+            raise HTTPException(status_code=400, detail="company_id is required for company-scoped apps")
+        get_company(company_id)
+        entry["company_id"] = company_id
+    else:
+        entry["company_id"] = None
+
+    for field in [
+        "display_name",
+        "winget_id",
+        "description",
+        "install_command_template",
+        "uninstall_command_template",
+        "detection_method",
+        "detection_id",
+        "silent_install_supported",
+        "silent_uninstall_supported",
+        "enabled",
+    ]:
+        if field in update:
+            entry[field] = update[field]
+    if "supported_actions" in update:
+        entry["supported_actions"] = validate_supported_actions(update["supported_actions"])
+    if not entry.get("detection_id"):
+        entry["detection_id"] = entry.get("winget_id")
+    entry["updated_at"] = utc_now()
+    save_app_catalog_entries(entries)
+    log_audit(
+        "APP_CATALOG_UPDATED",
+        f"App catalog entry updated for {entry.get('display_name')}",
+        company_id=entry.get("company_id"),
+        actor=user,
+        target_type="app_catalog",
+        target_label=entry.get("app_key"),
+        metadata={"app_id": entry.get("app_id")},
+    )
+    return entry
+
+
+def set_app_catalog_enabled(app_id, enabled, user):
+    entries = load_app_catalog_entries()
+    for entry in entries:
+        if entry.get("app_id") == app_id:
+            assert_can_manage_app_catalog(user, entry)
+            entry["enabled"] = enabled
+            entry["updated_at"] = utc_now()
+            save_app_catalog_entries(entries)
+            event_type = "APP_CATALOG_ENABLED" if enabled else "APP_CATALOG_DISABLED"
+            log_audit(
+                event_type,
+                f"App catalog entry {'enabled' if enabled else 'disabled'} for {entry.get('display_name')}",
+                company_id=entry.get("company_id"),
+                actor=user,
+                target_type="app_catalog",
+                target_label=entry.get("app_key"),
+                metadata={"app_id": entry.get("app_id")},
+            )
+            return entry
+    raise HTTPException(status_code=404, detail="App catalog entry not found")
 
 
 def get_default_company_for_legacy_data():
@@ -179,6 +573,10 @@ def save_jobs(jobs):
             row.company_name = company_name
             row.device_id = job.get("device_id") or "any"
             row.app = job.get("app")
+            row.app_key = job.get("app_key") or job.get("app")
+            row.display_name = job.get("display_name")
+            row.winget_id = job.get("winget_id")
+            row.detection_id = job.get("detection_id")
             row.action = job.get("action")
             row.status = job.get("status") or row.status
             row.attempts = int(job.get("attempts") or 0)
@@ -663,6 +1061,7 @@ def migrate_existing_json_data():
 def initialize_persistent_data():
     migrate_existing_json_data()
     load_users()
+    seed_default_app_catalog()
 
 
 initialize_persistent_data()
@@ -878,9 +1277,6 @@ def find_app_request(app_requests, request_id):
 
 
 def create_app_request_record(payload, user):
-    if payload.app not in ALLOWED_APPS:
-        raise HTTPException(status_code=400, detail="Unsupported app")
-
     if payload.action not in ALLOWED_ACTIONS:
         raise HTTPException(status_code=400, detail="Unsupported action")
 
@@ -903,6 +1299,7 @@ def create_app_request_record(payload, user):
         )
     assert_can_create_app_request(user, company_id)
     validate_app_request_target(company_id, target_device_id, require_approved_device=False)
+    app_catalog_entry = get_available_catalog_entry(payload.app, payload.action, company_id=company_id, user=user)
 
     now = utc_now()
     app_request = {
@@ -912,7 +1309,7 @@ def create_app_request_record(payload, user):
         "device_id": None if target_device_id == "any" else target_device_id,
         "target_device_id": target_device_id,
         "target_type": target_type,
-        "app": payload.app,
+        "app": app_catalog_entry.get("app_key"),
         "action": payload.action,
         "requested_by_user_id": user.get("user_id"),
         "requested_by_username": user.get("username"),
@@ -939,7 +1336,7 @@ def create_app_request_record(payload, user):
         request_id=app_request.get("request_id"),
         target_type=target_type,
         target_label=target_device_id,
-        metadata={"app": payload.app, "action": payload.action, "reason": payload.reason},
+        metadata={"app": app_catalog_entry.get("app_key"), "action": payload.action, "reason": payload.reason},
     )
     return app_request
 
@@ -959,9 +1356,15 @@ def approve_app_request_record(request_id, user, decision):
     validate_app_request_target(company_id, target_device_id, require_approved_device=True)
     if target_device_id == "any" and not company_has_approved_device(company_id):
         raise HTTPException(status_code=400, detail="Company must have at least one approved device")
+    app_catalog_entry = get_available_catalog_entry(
+        app_request.get("app"),
+        app_request.get("action"),
+        company_id=company_id,
+        user=user,
+    )
 
     job = create_executable_job(
-        app=app_request.get("app"),
+        app=app_catalog_entry.get("app_key"),
         action=app_request.get("action"),
         device_id="any" if target_device_id == "any" else target_device_id,
         company_id=company_id,
@@ -972,6 +1375,7 @@ def approve_app_request_record(request_id, user, decision):
         approved_by_username=user.get("username"),
         source_request_id=app_request.get("request_id"),
         actor=user,
+        app_catalog_entry=app_catalog_entry,
     )
 
     app_request["status"] = "converted_to_job"
@@ -1467,6 +1871,44 @@ def get_dashboard_html():
       <div id="companiesTable" class="table-wrap"></div>
     </section>
 
+    <section>
+      <div class="section-header">
+        <h2>App Catalog</h2>
+      </div>
+      <form id="catalogForm" class="actions">
+        <label>
+          App key
+          <input id="catalogAppKeyInput" name="app_key" type="text" required placeholder="7zip">
+        </label>
+        <label>
+          Display name
+          <input id="catalogDisplayNameInput" name="display_name" type="text" required placeholder="7-Zip">
+        </label>
+        <label>
+          Winget ID
+          <input id="catalogWingetIdInput" name="winget_id" type="text" required placeholder="7zip.7zip">
+        </label>
+        <label>
+          Actions
+          <select id="catalogActionsSelect" name="supported_actions">
+            <option value="install,uninstall">install, uninstall</option>
+            <option value="install">install</option>
+            <option value="uninstall">uninstall</option>
+          </select>
+        </label>
+        <label>
+          Scope
+          <select id="catalogScopeSelect" name="scope">
+            <option value="global">global</option>
+            <option value="company">company</option>
+          </select>
+        </label>
+        <button type="submit">Create App</button>
+      </form>
+      <div id="catalogMessage" class="message"></div>
+      <div id="catalogTable" class="table-wrap"></div>
+    </section>
+
     <section id="requestSection">
       <div class="section-header">
         <h2>Create App Request</h2>
@@ -1535,6 +1977,7 @@ def get_dashboard_html():
 
   <script>
     const companyFields = ["company_id", "company_name", "created_at", "updated_at"];
+    const catalogFields = ["app_id", "display_name", "app_key", "winget_id", "supported_actions", "enabled", "scope", "company_id", "updated_at"];
     const deviceFields = ["company_name", "hostname", "username", "os", "agent_version", "connection_status", "approval_status", "last_seen_at"];
     const requestFields = ["request_id", "company_name", "target_device_id", "app", "action", "requested_by_username", "status", "linked_job_id", "created_at"];
     const jobFields = ["id", "company_name", "device_id", "app", "action", "status", "attempts", "message", "started_at", "finished_at"];
@@ -1558,11 +2001,11 @@ def get_dashboard_html():
       "JOB_SKIPPED",
       "UNAUTHORIZED_ACCESS_ATTEMPT",
     ];
-    const preferredApps = ["7zip", "vlc", "chrome"];
     let currentUser = null;
     let lastCompanies = [];
     let lastDevices = [];
-    let lastCatalog = { apps: preferredApps, actions: ["install", "uninstall"] };
+    let lastCatalog = { apps: [], actions: ["install", "uninstall"], entries: [] };
+    let lastAppCatalog = [];
 
     function escapeHtml(value) {
       return String(value ?? "-")
@@ -1658,11 +2101,44 @@ def get_dashboard_html():
       target.innerHTML = `<table><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>`;
     }
 
+    function renderCatalog(rows) {
+      const target = document.getElementById("catalogTable");
+      if (!rows.length) {
+        target.innerHTML = '<div class="empty">No records found.</div>';
+        return;
+      }
+
+      const showActions = currentUser && currentUser.role === "system_admin";
+      const columns = showActions ? [...catalogFields, "actions"] : catalogFields;
+      const header = columns.map((field) => `<th>${escapeHtml(field)}</th>`).join("");
+      const body = rows.map((row) => {
+        const cells = catalogFields.map((field) => {
+          const value = Array.isArray(row[field]) ? row[field].join(", ") : row[field];
+          return `<td>${field === "enabled" ? statusCell(value ? "enabled" : "disabled") : escapeHtml(value)}</td>`;
+        }).join("");
+        const toggleAction = row.enabled ? "disable" : "enable";
+        const actions = `<button class="small secondary" type="button" data-catalog-edit="${escapeHtml(row.app_id)}">Edit</button> <button class="small" type="button" data-catalog-toggle="${escapeHtml(row.app_id)}" data-catalog-action="${toggleAction}">${toggleAction}</button>`;
+        return showActions ? `<tr>${cells}<td>${actions}</td></tr>` : `<tr>${cells}</tr>`;
+      }).join("");
+      target.innerHTML = `<table><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>`;
+    }
+
     function populateSelect(selectId, values) {
       const select = document.getElementById(selectId);
       const currentValue = select.value;
       select.innerHTML = values.map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("");
       if (values.includes(currentValue)) {
+        select.value = currentValue;
+      }
+    }
+
+    function populateAppSelect(entries) {
+      const select = document.getElementById("appSelect");
+      const currentValue = select.value;
+      select.innerHTML = entries.map((entry) => {
+        return `<option value="${escapeHtml(entry.app_key)}">${escapeHtml(entry.display_name || entry.app_key)}</option>`;
+      }).join("");
+      if (entries.some((entry) => entry.app_key === currentValue)) {
         select.value = currentValue;
       }
     }
@@ -1675,15 +2151,18 @@ def get_dashboard_html():
         return device.company_id === selectedCompanyId && device.approval_status === "approved";
       });
       const deviceIds = ["any", ...approvedDevices.map((device) => device.device_id).filter(Boolean)];
-      const apps = preferredApps.filter((app) => lastCatalog.apps.includes(app));
-      const extraApps = lastCatalog.apps.filter((app) => !apps.includes(app));
+      const catalogEntries = (lastCatalog.entries || []).filter((entry) => {
+        return entry.enabled && (entry.scope === "global" || entry.company_id === selectedCompanyId);
+      });
       populateSelect("companySelect", companyOptions);
       if (selectedCompanyId && companyOptions.includes(selectedCompanyId)) {
         companySelect.value = selectedCompanyId;
       }
       populateSelect("deviceSelect", [...deviceIds]);
-      populateSelect("appSelect", [...apps, ...extraApps]);
-      populateSelect("actionSelect", lastCatalog.actions);
+      populateAppSelect(catalogEntries);
+      const selectedApp = document.getElementById("appSelect").value;
+      const selectedEntry = catalogEntries.find((entry) => entry.app_key === selectedApp);
+      populateSelect("actionSelect", selectedEntry ? selectedEntry.supported_actions : lastCatalog.actions);
     }
 
     function refreshAuditFilters() {
@@ -1716,6 +2195,7 @@ def get_dashboard_html():
       }
       document.getElementById("userInfo").textContent = `${currentUser.username} (${currentUser.role})`;
       document.getElementById("companyForm").style.display = currentUser.role === "system_admin" ? "" : "none";
+      document.getElementById("catalogForm").style.display = currentUser.role === "system_admin" ? "" : "none";
       document.getElementById("requestSection").style.display = "";
       document.getElementById("companySelect").disabled = currentUser.role !== "system_admin";
       document.getElementById("auditCompanyLabel").style.display = currentUser.role === "system_admin" ? "" : "none";
@@ -1723,7 +2203,7 @@ def get_dashboard_html():
 
     async function refreshAll() {
       try {
-        const [session, health, companies, devices, requests, jobs, auditLogs, catalog] = await Promise.all([
+        const [session, health, companies, devices, requests, jobs, auditLogs, catalog, appCatalog] = await Promise.all([
           fetchJson("/dashboard/api/session"),
           fetchJson("/health"),
           fetchJson("/dashboard/api/companies"),
@@ -1732,6 +2212,7 @@ def get_dashboard_html():
           fetchJson("/dashboard/api/jobs"),
           fetchJson(getAuditPath()),
           fetchJson("/dashboard/api/catalog"),
+          fetchJson("/api/app-catalog"),
         ]);
 
         currentUser = session.user;
@@ -1740,9 +2221,11 @@ def get_dashboard_html():
         lastCompanies = Array.isArray(companies) ? companies : [];
         lastDevices = Array.isArray(devices) ? devices : [];
         lastCatalog = catalog;
+        lastAppCatalog = Array.isArray(appCatalog) ? appCatalog : [];
         refreshFormOptions();
         refreshAuditFilters();
         renderTable("companiesTable", companyFields, lastCompanies);
+        renderCatalog(lastAppCatalog);
         renderDevices(lastDevices);
         renderRequests(Array.isArray(requests) ? [...requests].reverse() : []);
         renderTable("jobsTable", jobFields, Array.isArray(jobs) ? [...jobs].reverse() : []);
@@ -1773,6 +2256,88 @@ def get_dashboard_html():
       } catch (error) {
         message.textContent = error.message;
         message.className = "message error";
+      }
+    }
+
+    async function createCatalogEntry(event) {
+      event.preventDefault();
+      const message = document.getElementById("catalogMessage");
+      message.textContent = "";
+      message.className = "message";
+      const selectedCompanyId = document.getElementById("companySelect").value || (lastCompanies[0] && lastCompanies[0].company_id) || "";
+      const scope = document.getElementById("catalogScopeSelect").value;
+      const payload = {
+        app_key: document.getElementById("catalogAppKeyInput").value,
+        display_name: document.getElementById("catalogDisplayNameInput").value,
+        winget_id: document.getElementById("catalogWingetIdInput").value,
+        detection_id: document.getElementById("catalogWingetIdInput").value,
+        supported_actions: document.getElementById("catalogActionsSelect").value.split(",").map((value) => value.trim()),
+        scope,
+      };
+      if (scope === "company") {
+        payload.company_id = selectedCompanyId;
+      }
+
+      try {
+        const entry = await fetchJson("/api/app-catalog", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        message.textContent = `Created app ${entry.app_key}`;
+        document.getElementById("catalogAppKeyInput").value = "";
+        document.getElementById("catalogDisplayNameInput").value = "";
+        document.getElementById("catalogWingetIdInput").value = "";
+        await refreshAll();
+      } catch (error) {
+        message.textContent = error.message;
+        message.className = "message error";
+      }
+    }
+
+    async function editCatalogEntry(appId) {
+      const entries = lastAppCatalog;
+      const entry = entries.find((candidate) => candidate.app_id === appId);
+      if (!entry) {
+        return;
+      }
+      const displayName = prompt("Display name", entry.display_name || "");
+      if (displayName === null) {
+        return;
+      }
+      const wingetId = prompt("Winget ID", entry.winget_id || "");
+      if (wingetId === null) {
+        return;
+      }
+      const supportedActions = prompt("Supported actions", (entry.supported_actions || []).join(","));
+      if (supportedActions === null) {
+        return;
+      }
+      try {
+        await fetchJson(`/api/app-catalog/${encodeURIComponent(appId)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            display_name: displayName,
+            winget_id: wingetId,
+            detection_id: wingetId,
+            supported_actions: supportedActions.split(",").map((value) => value.trim()).filter(Boolean),
+          }),
+        });
+        await refreshAll();
+      } catch (error) {
+        document.getElementById("catalogMessage").textContent = error.message;
+        document.getElementById("catalogMessage").className = "message error";
+      }
+    }
+
+    async function toggleCatalogEntry(appId, action) {
+      try {
+        await fetchJson(`/api/app-catalog/${encodeURIComponent(appId)}/${action}`, { method: "POST" });
+        await refreshAll();
+      } catch (error) {
+        document.getElementById("catalogMessage").textContent = error.message;
+        document.getElementById("catalogMessage").className = "message error";
       }
     }
 
@@ -1833,7 +2398,9 @@ def get_dashboard_html():
       window.location.href = "/login";
     });
     document.getElementById("companySelect").addEventListener("change", refreshFormOptions);
+    document.getElementById("appSelect").addEventListener("change", refreshFormOptions);
     document.getElementById("companyForm").addEventListener("submit", createCompany);
+    document.getElementById("catalogForm").addEventListener("submit", createCatalogEntry);
     document.getElementById("requestForm").addEventListener("submit", createAppRequest);
     document.getElementById("auditFilterForm").addEventListener("submit", (event) => {
       event.preventDefault();
@@ -1857,6 +2424,17 @@ def get_dashboard_html():
       }
       if (rejectId) {
         updateRequestApproval(rejectId, "reject");
+      }
+    });
+    document.getElementById("catalogTable").addEventListener("click", (event) => {
+      const editId = event.target.getAttribute("data-catalog-edit");
+      const toggleId = event.target.getAttribute("data-catalog-toggle");
+      const action = event.target.getAttribute("data-catalog-action");
+      if (editId) {
+        editCatalogEntry(editId);
+      }
+      if (toggleId && action) {
+        toggleCatalogEntry(toggleId, action);
       }
     });
     refreshAll();
@@ -1930,8 +2508,8 @@ def dashboard_session(request: Request):
 
 @app.get("/dashboard/api/catalog")
 def dashboard_catalog(request: Request):
-    get_current_user(request)
-    return get_catalog()
+    user = get_current_user(request)
+    return build_catalog_response(user, enabled_only=True)
 
 
 @app.get("/dashboard/api/companies")
@@ -2066,11 +2644,67 @@ def health():
     return {"status": "ok"}
 
 
+def build_catalog_response(user=None, enabled_only=True):
+    entries = load_app_catalog_entries()
+    if user is not None:
+        entries = filter_catalog_for_user(entries, user, enabled_only=enabled_only)
+    elif enabled_only:
+        entries = [entry for entry in entries if entry.get("enabled")]
+
+    apps = [entry.get("app_key") for entry in entries if entry.get("app_key")]
+    actions = sorted(
+        {
+            action
+            for entry in entries
+            for action in (entry.get("supported_actions") or [])
+            if action in ALLOWED_ACTIONS
+        }
+    )
+    return {"apps": apps, "actions": actions, "entries": entries}
+
+
 @app.get("/api/catalog")
-def get_catalog():
-    catalog = load_catalog()
-    apps = [app_key for app_key in catalog.keys() if app_key in ALLOWED_APPS]
-    return {"apps": apps, "actions": sorted(ALLOWED_ACTIONS)}
+def get_catalog(request: Request, enabled_only: bool = True):
+    user = get_current_user(request)
+    return build_catalog_response(user, enabled_only=enabled_only)
+
+
+@app.get("/api/app-catalog")
+def list_app_catalog(request: Request, enabled_only: bool = False):
+    user = get_current_user(request)
+    if user.get("role") == "viewer":
+        enabled_only = True
+    return filter_catalog_for_user(load_app_catalog_entries(), user, enabled_only=enabled_only)
+
+
+@app.post("/api/app-catalog")
+def create_app_catalog(request: Request, payload: CreateAppCatalogRequest):
+    user = get_current_user(request)
+    return create_app_catalog_entry(payload, user)
+
+
+@app.patch("/api/app-catalog/{app_id}")
+def update_app_catalog(request: Request, app_id: str, payload: UpdateAppCatalogRequest):
+    user = get_current_user(request)
+    return update_app_catalog_entry(app_id, payload, user)
+
+
+@app.put("/api/app-catalog/{app_id}")
+def put_app_catalog(request: Request, app_id: str, payload: UpdateAppCatalogRequest):
+    user = get_current_user(request)
+    return update_app_catalog_entry(app_id, payload, user)
+
+
+@app.post("/api/app-catalog/{app_id}/enable")
+def enable_app_catalog(request: Request, app_id: str):
+    user = get_current_user(request)
+    return set_app_catalog_enabled(app_id, True, user)
+
+
+@app.post("/api/app-catalog/{app_id}/disable")
+def disable_app_catalog(request: Request, app_id: str):
+    user = get_current_user(request)
+    return set_app_catalog_enabled(app_id, False, user)
 
 
 @app.post("/api/admin/tenants")
@@ -2189,9 +2823,6 @@ def get_agent_jobs(device_id: str):
 
 @app.post("/api/agent/jobs")
 def create_job(request: CreateJobRequest, actor=None):
-    if request.app not in ALLOWED_APPS:
-        raise HTTPException(status_code=400, detail="Unsupported app")
-
     if request.action not in ALLOWED_ACTIONS:
         raise HTTPException(status_code=400, detail="Unsupported action")
 
@@ -2217,14 +2848,21 @@ def create_job(request: CreateJobRequest, actor=None):
 
     if not company_id:
         raise HTTPException(status_code=400, detail="Job company could not be resolved")
+    app_catalog_entry = get_available_catalog_entry(
+        request.app,
+        request.action,
+        company_id=company_id,
+        user=actor,
+    )
 
     return create_executable_job(
-        app=request.app,
+        app=app_catalog_entry.get("app_key"),
         action=request.action,
         device_id=request.device_id,
         company_id=company_id,
         company_name=company_name,
         actor=actor,
+        app_catalog_entry=app_catalog_entry,
     )
 
 
@@ -2240,7 +2878,11 @@ def create_executable_job(
     approved_by_username=None,
     source_request_id=None,
     actor=None,
+    app_catalog_entry=None,
 ):
+    if app_catalog_entry is None:
+        app_catalog_entry = get_available_catalog_entry(app, action, company_id=company_id, user=actor)
+    snapshot = app_catalog_to_agent_snapshot(app_catalog_entry)
     jobs = load_jobs()
     job = {
         "id": f"job-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}",
@@ -2248,6 +2890,10 @@ def create_executable_job(
         "company_name": company_name,
         "device_id": device_id,
         "app": app,
+        "app_key": snapshot.get("app_key"),
+        "display_name": snapshot.get("display_name"),
+        "winget_id": snapshot.get("winget_id"),
+        "detection_id": snapshot.get("detection_id"),
         "action": action,
         "status": "approved",
         "created_by_user_id": created_by_user_id,
