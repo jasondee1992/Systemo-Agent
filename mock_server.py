@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 
@@ -12,6 +13,7 @@ BASE_DIR = Path(__file__).resolve().parent
 BACKEND_DIR = BASE_DIR / "mock_backend"
 JOBS_FILE = BACKEND_DIR / "jobs.json"
 DEVICES_FILE = BACKEND_DIR / "devices.json"
+CATALOG_FILE = BASE_DIR / "app_catalog.json"
 ALLOWED_APPS = {"vlc", "chrome", "7zip"}
 ALLOWED_ACTIONS = {"install", "uninstall"}
 
@@ -45,6 +47,19 @@ class DeviceCheckInRequest(BaseModel):
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def load_catalog():
+    if not CATALOG_FILE.exists():
+        raise HTTPException(status_code=500, detail="app_catalog.json not found")
+
+    with CATALOG_FILE.open("r", encoding="utf-8") as file:
+        catalog = json.load(file)
+
+    if not isinstance(catalog, dict):
+        raise HTTPException(status_code=500, detail="app_catalog.json must contain an object")
+
+    return catalog
 
 
 def load_jobs():
@@ -95,9 +110,466 @@ def save_devices(devices):
     temp_file.replace(DEVICES_FILE)
 
 
+def get_dashboard_html():
+    return """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Systemo Agent Console</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --line: #d9dee7;
+      --text: #17202a;
+      --muted: #5f6b7a;
+      --accent: #0f766e;
+      --accent-dark: #115e59;
+      --danger: #b42318;
+      --ok: #16703c;
+      --warn: #a15c07;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", Arial, sans-serif;
+      font-size: 14px;
+    }
+
+    header {
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+
+    .topbar {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 18px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 24px;
+      font-weight: 650;
+      letter-spacing: 0;
+    }
+
+    main {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 24px;
+      display: grid;
+      gap: 20px;
+    }
+
+    section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+
+    .section-header {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    h2 {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 650;
+      letter-spacing: 0;
+    }
+
+    .health {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--warn);
+    }
+
+    .dot.ok {
+      background: var(--ok);
+    }
+
+    .dot.error {
+      background: var(--danger);
+    }
+
+    .actions {
+      display: flex;
+      align-items: end;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding: 16px;
+    }
+
+    label {
+      display: grid;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    select,
+    button {
+      min-height: 36px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      font: inherit;
+    }
+
+    select {
+      min-width: 150px;
+      background: #ffffff;
+      color: var(--text);
+      padding: 0 10px;
+    }
+
+    button {
+      background: var(--accent);
+      color: #ffffff;
+      border-color: var(--accent);
+      padding: 0 14px;
+      font-weight: 650;
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: var(--accent-dark);
+      border-color: var(--accent-dark);
+    }
+
+    .secondary {
+      background: #ffffff;
+      color: var(--text);
+      border-color: var(--line);
+    }
+
+    .secondary:hover {
+      background: #eef2f6;
+      border-color: #c8d0dc;
+    }
+
+    .message {
+      padding: 0 16px 16px;
+      color: var(--muted);
+      min-height: 18px;
+    }
+
+    .message.error {
+      color: var(--danger);
+    }
+
+    .table-wrap {
+      width: 100%;
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 920px;
+    }
+
+    th,
+    td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      font-size: 12px;
+      color: var(--muted);
+      background: #fbfcfd;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    td {
+      max-width: 260px;
+      overflow-wrap: anywhere;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .status {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 3px 8px;
+      background: #edf2f7;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .status.online,
+    .status.success {
+      background: #e8f5ee;
+      color: var(--ok);
+    }
+
+    .status.failed,
+    .status.requires_user_action {
+      background: #fff0ed;
+      color: var(--danger);
+    }
+
+    .status.approved,
+    .status.installing,
+    .status.uninstalling {
+      background: #fff7e8;
+      color: var(--warn);
+    }
+
+    .empty {
+      padding: 18px 16px;
+      color: var(--muted);
+    }
+
+    @media (max-width: 720px) {
+      .topbar,
+      main {
+        padding-left: 14px;
+        padding-right: 14px;
+      }
+
+      .actions {
+        display: grid;
+        grid-template-columns: 1fr;
+      }
+
+      select,
+      button {
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="topbar">
+      <h1>Systemo Agent Console</h1>
+      <div class="health"><span id="healthDot" class="dot"></span><span id="healthText">Checking backend</span></div>
+      <button id="refreshButton" class="secondary" type="button">Refresh</button>
+    </div>
+  </header>
+
+  <main>
+    <section>
+      <div class="section-header">
+        <h2>Create Job</h2>
+      </div>
+      <form id="jobForm" class="actions">
+        <label>
+          Device target
+          <select id="deviceSelect" name="device_id"></select>
+        </label>
+        <label>
+          App
+          <select id="appSelect" name="app"></select>
+        </label>
+        <label>
+          Action
+          <select id="actionSelect" name="action"></select>
+        </label>
+        <button type="submit">Create Job</button>
+      </form>
+      <div id="formMessage" class="message"></div>
+    </section>
+
+    <section>
+      <div class="section-header">
+        <h2>Devices</h2>
+      </div>
+      <div id="devicesTable" class="table-wrap"></div>
+    </section>
+
+    <section>
+      <div class="section-header">
+        <h2>Jobs</h2>
+      </div>
+      <div id="jobsTable" class="table-wrap"></div>
+    </section>
+  </main>
+
+  <script>
+    const deviceFields = ["device_id", "hostname", "username", "os", "agent_version", "status", "last_seen_at"];
+    const jobFields = ["id", "device_id", "app", "action", "status", "attempts", "message", "started_at", "finished_at"];
+    const preferredApps = ["7zip", "vlc", "chrome"];
+    let lastDevices = [];
+    let lastCatalog = { apps: preferredApps, actions: ["install", "uninstall"] };
+
+    function escapeHtml(value) {
+      return String(value ?? "-")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    async function fetchJson(path, options) {
+      const response = await fetch(path, options);
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || `${response.status} ${response.statusText}`);
+      }
+      return response.json();
+    }
+
+    function setHealth(ok, text) {
+      const dot = document.getElementById("healthDot");
+      const healthText = document.getElementById("healthText");
+      dot.className = ok ? "dot ok" : "dot error";
+      healthText.textContent = text;
+    }
+
+    function statusCell(value) {
+      const safe = escapeHtml(value);
+      const className = String(value ?? "").replaceAll(" ", "_");
+      return `<span class="status ${escapeHtml(className)}">${safe}</span>`;
+    }
+
+    function renderTable(targetId, fields, rows) {
+      const target = document.getElementById(targetId);
+      if (!rows.length) {
+        target.innerHTML = '<div class="empty">No records found.</div>';
+        return;
+      }
+
+      const header = fields.map((field) => `<th>${escapeHtml(field)}</th>`).join("");
+      const body = rows.map((row) => {
+        const cells = fields.map((field) => {
+          const value = row[field];
+          return `<td>${field === "status" ? statusCell(value) : escapeHtml(value)}</td>`;
+        }).join("");
+        return `<tr>${cells}</tr>`;
+      }).join("");
+      target.innerHTML = `<table><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>`;
+    }
+
+    function populateSelect(selectId, values) {
+      const select = document.getElementById(selectId);
+      const currentValue = select.value;
+      select.innerHTML = values.map((value) => `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("");
+      if (values.includes(currentValue)) {
+        select.value = currentValue;
+      }
+    }
+
+    function refreshFormOptions() {
+      const deviceIds = ["any", ...lastDevices.map((device) => device.device_id).filter(Boolean)];
+      const apps = preferredApps.filter((app) => lastCatalog.apps.includes(app));
+      const extraApps = lastCatalog.apps.filter((app) => !apps.includes(app));
+      populateSelect("deviceSelect", [...deviceIds]);
+      populateSelect("appSelect", [...apps, ...extraApps]);
+      populateSelect("actionSelect", lastCatalog.actions);
+    }
+
+    async function refreshAll() {
+      try {
+        const [health, devices, jobs, catalog] = await Promise.all([
+          fetchJson("/health"),
+          fetchJson("/api/devices"),
+          fetchJson("/api/agent/jobs/all"),
+          fetchJson("/api/catalog"),
+        ]);
+
+        setHealth(health.status === "ok", `Backend ${health.status}`);
+        lastDevices = Array.isArray(devices) ? devices : [];
+        lastCatalog = catalog;
+        refreshFormOptions();
+        renderTable("devicesTable", deviceFields, lastDevices);
+        renderTable("jobsTable", jobFields, Array.isArray(jobs) ? [...jobs].reverse() : []);
+      } catch (error) {
+        setHealth(false, "Backend unavailable");
+        document.getElementById("formMessage").textContent = error.message;
+        document.getElementById("formMessage").className = "message error";
+      }
+    }
+
+    async function createJob(event) {
+      event.preventDefault();
+      const message = document.getElementById("formMessage");
+      message.textContent = "";
+      message.className = "message";
+
+      const payload = {
+        device_id: document.getElementById("deviceSelect").value,
+        app: document.getElementById("appSelect").value,
+        action: document.getElementById("actionSelect").value,
+      };
+
+      try {
+        const job = await fetchJson("/api/agent/jobs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        message.textContent = `Created job ${job.id}`;
+        await refreshAll();
+      } catch (error) {
+        message.textContent = error.message;
+        message.className = "message error";
+      }
+    }
+
+    document.getElementById("refreshButton").addEventListener("click", refreshAll);
+    document.getElementById("jobForm").addEventListener("submit", createJob);
+    refreshAll();
+    setInterval(refreshAll, 5000);
+  </script>
+</body>
+</html>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard():
+    return HTMLResponse(get_dashboard_html())
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/api/catalog")
+def get_catalog():
+    catalog = load_catalog()
+    apps = [app_key for app_key in catalog.keys() if app_key in ALLOWED_APPS]
+    return {"apps": apps, "actions": sorted(ALLOWED_ACTIONS)}
 
 
 @app.get("/api/agent/jobs")

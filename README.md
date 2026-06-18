@@ -271,6 +271,36 @@ python .\agent_cli.py api-show-device <device_id>
 
 Verify that your local `device_id` appears and that `last_seen_at` updates while the agent is running in API mode.
 
+## Phase 8 Mock Web Dashboard
+
+The mock backend serves a local development dashboard at:
+
+```text
+http://127.0.0.1:8008
+```
+
+Run the mock server:
+
+```powershell
+python mock_server.py
+```
+
+Open the dashboard in your browser:
+
+```text
+http://127.0.0.1:8008
+```
+
+Set the agent to API mode and restart the scheduled task:
+
+```powershell
+python .\agent_cli.py set-mode api
+Stop-ScheduledTask -TaskName "Systemo Agent"
+Start-ScheduledTask -TaskName "Systemo Agent"
+```
+
+From the dashboard, create a `7zip` `install` job, wait for the job table to update, then create a `7zip` `uninstall` job. The dashboard uses the mock API and approved catalog options only; it is for local development testing and does not include authentication yet.
+
 To test VLC detection after uninstall:
 
 ```powershell
