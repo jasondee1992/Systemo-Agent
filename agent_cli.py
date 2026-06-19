@@ -70,6 +70,15 @@ INVENTORY_DISPLAY_FIELDS = [
     "is_catalog_match",
     "last_seen_at",
 ]
+AUDIT_DISPLAY_FIELDS = [
+    "created_at",
+    "action",
+    "actor_type",
+    "actor_name",
+    "target_type",
+    "target_id",
+    "message",
+]
 TENANT_DISPLAY_FIELDS = [
     "tenant_id",
     "company_name",
@@ -659,6 +668,48 @@ def api_update_tenant(tenant_id, company_name=None, status=None):
     print(f"Updated tenant {tenant.get('tenant_id')}.")
 
 
+def print_audit_log(entry):
+    if not isinstance(entry, dict):
+        print("- Invalid audit log entry")
+        return
+
+    print(f"- {get_job_value(entry, 'created_at')}")
+    print(f"  action: {get_job_value(entry, 'action')}")
+    actor_name = entry.get("actor_name") or entry.get("actor_username") or "-"
+    actor_type = entry.get("actor_type") or entry.get("actor_role") or "-"
+    print(f"  actor: {actor_type} / {actor_name}")
+    print(f"  target: {get_job_value(entry, 'target_type')} / {get_job_value(entry, 'target_id')}")
+    print(f"  tenant_id: {get_job_value(entry, 'tenant_id')}")
+    print(f"  message: {get_job_value(entry, 'message')}")
+
+
+def print_audit_logs(entries):
+    if not entries:
+        print("No audit logs found.")
+        return
+
+    for entry in entries:
+        print_audit_log(entry)
+
+
+def api_list_audit_logs(tenant_id=None, limit=100):
+    config = load_or_create_agent_config()
+    requests = get_requests_module()
+    params = {"limit": limit}
+    if tenant_id:
+        params["tenant_id"] = tenant_id
+    response = requests.get(
+        f"{get_api_base_url(config)}/api/admin/audit-logs",
+        params=params,
+        timeout=10,
+    )
+    response.raise_for_status()
+    entries = response.json()
+    if not isinstance(entries, list):
+        raise ValueError("API audit logs response must be a JSON array")
+    print_audit_logs(entries)
+
+
 def detect_app(app):
     catalog = load_catalog()
     if app not in catalog:
@@ -1010,6 +1061,10 @@ def build_parser():
     api_update_tenant_parser.add_argument("--name", dest="company_name")
     api_update_tenant_parser.add_argument("--status", choices=["active", "inactive"])
 
+    api_list_audit_logs_parser = subparsers.add_parser("api-list-audit-logs", help="List mock API audit logs")
+    api_list_audit_logs_parser.add_argument("--tenant-id")
+    api_list_audit_logs_parser.add_argument("--limit", type=int, default=100)
+
     detect_parser = subparsers.add_parser("detect", help="Run approved app detection")
     detect_parser.add_argument("app")
 
@@ -1079,6 +1134,8 @@ def main():
             api_show_tenant(args.tenant_id)
         elif args.command == "api-update-tenant":
             api_update_tenant(args.tenant_id, args.company_name, args.status)
+        elif args.command == "api-list-audit-logs":
+            api_list_audit_logs(args.tenant_id, args.limit)
         elif args.command == "detect":
             detect_app(args.app)
         elif args.command == "scan-inventory":

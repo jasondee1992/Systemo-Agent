@@ -164,6 +164,25 @@ AUDIT_JOB_RESULT_EVENTS = {
     "requires_user_action": "JOB_FAILED",
     "skipped": "JOB_SKIPPED",
 }
+AUDIT_EVENT_ACTIONS = {
+    "APP_REQUEST_APPROVED": "ticket_approved",
+    "APP_REQUEST_CREATED": "ticket_created",
+    "APP_REQUEST_REJECTED": "ticket_rejected",
+    "DEVICE_APPROVED": "device_approved",
+    "DEVICE_ENROLLED": "device_enrolled",
+    "DEVICE_HEARTBEAT_FIRST_SEEN": "device_check_in",
+    "DEVICE_REJECTED": "device_rejected",
+    "JOB_CREATED": "job_created",
+    "JOB_FAILED": "job_failed",
+    "JOB_SKIPPED": "job_skipped",
+    "JOB_STARTED": "job_started",
+    "JOB_SUCCESS": "job_success",
+    "TENANT_CREATED": "tenant_created",
+    "TENANT_UPDATED": "tenant_updated",
+    "USER_LOGIN_FAILED": "user_login_failed",
+    "USER_LOGIN_SUCCESS": "user_login_success",
+    "USER_LOGOUT": "user_logout",
+}
 
 DEFAULT_APP_CATALOG = [
     {
@@ -937,6 +956,158 @@ def save_audit_logs(audit_logs):
             row.message = audit_log.get("message") or ""
             row.metadata_json = json.dumps(audit_log.get("metadata") or {})
             row.created_at = audit_log.get("created_at") or row.created_at or utc_now()
+    write_audit_logs_json(audit_logs)
+
+
+def safe_actor_type(actor_type):
+    if actor_type in {"system_admin", "company_admin", "user", "agent", "system"}:
+        return actor_type
+    if actor_type == "viewer":
+        return "user"
+    return "system"
+
+
+def action_from_event_type(event_type):
+    return AUDIT_EVENT_ACTIONS.get(event_type, (event_type or "activity").lower())
+
+
+def infer_actor_type(event_type, actor, device_id=None):
+    if isinstance(actor, dict) and actor.get("role"):
+        return safe_actor_type(actor.get("role"))
+    if event_type in {
+        "INVENTORY_SCAN_STARTED",
+        "INVENTORY_SCAN_SUCCESS",
+        "INVENTORY_SCAN_FAILED",
+        "INVENTORY_UPDATED",
+        "JOB_STARTED",
+        "JOB_SUCCESS",
+        "JOB_FAILED",
+        "JOB_SKIPPED",
+    }:
+        return "agent"
+    if event_type in {"DEVICE_ENROLLED", "DEVICE_HEARTBEAT_FIRST_SEEN"}:
+        return "agent" if device_id else "system"
+    return "system"
+
+
+def normalize_audit_record(audit_entry):
+    if not isinstance(audit_entry, dict):
+        return {}
+
+    metadata = audit_entry.get("details")
+    if metadata is None:
+        metadata = audit_entry.get("metadata")
+    if metadata is None and audit_entry.get("metadata_json"):
+        try:
+            metadata = json.loads(audit_entry.get("metadata_json") or "{}")
+        except json.JSONDecodeError:
+            metadata = {}
+
+    tenant_id = audit_entry.get("tenant_id") or audit_entry.get("company_id")
+    actor_type = safe_actor_type(
+        audit_entry.get("actor_type")
+        or audit_entry.get("actor_role")
+        or infer_actor_type(audit_entry.get("event_type"), {}, audit_entry.get("device_id"))
+    )
+    target_id = (
+        audit_entry.get("target_id")
+        or audit_entry.get("job_id")
+        or audit_entry.get("request_id")
+        or audit_entry.get("device_id")
+        or audit_entry.get("target_label")
+    )
+    actor_id = audit_entry.get("actor_id") or audit_entry.get("actor_user_id")
+    actor_name = audit_entry.get("actor_name") or audit_entry.get("actor_username")
+    if actor_type == "agent":
+        actor_id = actor_id or audit_entry.get("device_id")
+        actor_name = actor_name or audit_entry.get("target_label") or audit_entry.get("device_id") or "Systemo Agent"
+    elif actor_type == "system":
+        actor_id = actor_id or "system"
+        actor_name = actor_name or "System"
+
+    return {
+        "audit_id": audit_entry.get("audit_id"),
+        "tenant_id": tenant_id,
+        "company_id": tenant_id,
+        "company_name": audit_entry.get("company_name"),
+        "actor_type": actor_type,
+        "actor_id": actor_id,
+        "actor_name": actor_name,
+        "actor_role": audit_entry.get("actor_role") or actor_type,
+        "actor_username": audit_entry.get("actor_username") or actor_name,
+        "action": audit_entry.get("action") or action_from_event_type(audit_entry.get("event_type")),
+        "event_type": audit_entry.get("event_type"),
+        "target_type": audit_entry.get("target_type"),
+        "target_id": target_id,
+        "target_label": audit_entry.get("target_label") or target_id,
+        "message": audit_entry.get("message") or "",
+        "details": metadata or {},
+        "metadata": metadata or {},
+        "created_at": audit_entry.get("created_at"),
+    }
+
+
+def write_audit_logs_json(audit_logs=None):
+    try:
+        BACKEND_DIR.mkdir(parents=True, exist_ok=True)
+        entries = audit_logs if audit_logs is not None else load_audit_logs()
+        normalized_entries = [normalize_audit_record(entry) for entry in entries if isinstance(entry, dict)]
+        with AUDIT_LOGS_FILE.open("w", encoding="utf-8") as file:
+            json.dump(normalized_entries, file, indent=2)
+            file.write("\n")
+    except Exception:
+        # The SQLite audit log is authoritative; JSON mirror failures should not break backend flows.
+        pass
+
+
+def record_audit_log(
+    tenant_id,
+    actor_type,
+    actor_id,
+    actor_name,
+    action,
+    target_type,
+    target_id,
+    message,
+    details=None,
+    company_name=None,
+    event_type=None,
+    actor_role=None,
+    device_id=None,
+    request_id=None,
+    job_id=None,
+    target_label=None,
+):
+    event_type = event_type or str(action or "activity").upper()
+    resolved_target_id = target_id or job_id or request_id or device_id or target_label
+    audit_entry = {
+        "audit_id": f"audit-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}",
+        "event_type": event_type,
+        "company_id": tenant_id,
+        "company_name": company_name,
+        "actor_user_id": actor_id if actor_type in {"system_admin", "company_admin", "user"} else None,
+        "actor_username": actor_name if actor_type in {"system_admin", "company_admin", "user"} else None,
+        "actor_role": actor_role or actor_type,
+        "device_id": device_id or (resolved_target_id if target_type == "device" else None),
+        "request_id": request_id or (resolved_target_id if target_type in {"ticket", "app_request", "request"} else None),
+        "job_id": job_id or (resolved_target_id if target_type == "job" else None),
+        "target_type": target_type,
+        "target_label": target_label or resolved_target_id,
+        "message": message,
+        "metadata": details or {},
+        "tenant_id": tenant_id,
+        "actor_type": safe_actor_type(actor_type),
+        "actor_id": actor_id,
+        "actor_name": actor_name,
+        "action": action,
+        "target_id": resolved_target_id,
+        "details": details or {},
+        "created_at": utc_now(),
+    }
+    audit_logs = load_audit_logs()
+    audit_logs.append(audit_entry)
+    save_audit_logs(audit_logs)
+    return normalize_audit_record(audit_entry)
 
 
 def log_audit(
@@ -953,27 +1124,34 @@ def log_audit(
     metadata=None,
 ):
     actor = actor if isinstance(actor, dict) else {}
-    audit_entry = {
-        "audit_id": f"audit-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}",
-        "event_type": event_type,
-        "company_id": company_id,
-        "company_name": company_name,
-        "actor_user_id": actor.get("user_id"),
-        "actor_username": actor.get("username"),
-        "actor_role": actor.get("role"),
-        "device_id": device_id,
-        "request_id": request_id,
-        "job_id": job_id,
-        "target_type": target_type,
-        "target_label": target_label,
-        "message": message,
-        "metadata": metadata or {},
-        "created_at": utc_now(),
-    }
-    audit_logs = load_audit_logs()
-    audit_logs.append(audit_entry)
-    save_audit_logs(audit_logs)
-    return audit_entry
+    actor_type = infer_actor_type(event_type, actor, device_id=device_id)
+    actor_id = actor.get("user_id")
+    actor_name = actor.get("username")
+    if actor_type == "agent":
+        actor_id = actor_id or device_id
+        actor_name = actor_name or device_id or "Systemo Agent"
+    elif actor_type == "system":
+        actor_id = actor_id or "system"
+        actor_name = actor_name or "System"
+    target_id = job_id or request_id or device_id or target_label
+    return record_audit_log(
+        tenant_id=company_id,
+        actor_type=actor_type,
+        actor_id=actor_id,
+        actor_name=actor_name,
+        action=action_from_event_type(event_type),
+        target_type=target_type,
+        target_id=target_id,
+        message=message,
+        details=metadata or {},
+        company_name=company_name,
+        event_type=event_type,
+        actor_role=actor.get("role") or actor_type,
+        device_id=device_id,
+        request_id=request_id,
+        job_id=job_id,
+        target_label=target_label,
+    )
 
 
 def load_devices():
@@ -1128,7 +1306,7 @@ def find_company_by_name(companies, company_name):
     return find_company_by_id(companies, company_id)
 
 
-def get_or_create_company(company_name):
+def get_or_create_company(company_name, actor=None):
     companies = load_tenants()
     company_id = slugify_company_name(company_name)
     existing_company = find_company_by_id(companies, company_id)
@@ -1146,6 +1324,16 @@ def get_or_create_company(company_name):
     }
     companies.append(company)
     save_tenants(companies)
+    log_audit(
+        "TENANT_CREATED",
+        f"Company {company.get('company_name')} was created.",
+        company_id=company.get("company_id"),
+        company_name=company.get("company_name"),
+        actor=actor,
+        target_type="tenant",
+        target_label=company.get("company_id"),
+        metadata={"company_name": company.get("company_name")},
+    )
     return company
 
 
@@ -2206,8 +2394,12 @@ def get_dashboard_html():
           <select id="auditCompanySelect" name="company_id"></select>
         </label>
         <label>
-          Event type
-          <select id="auditEventSelect" name="event_type"></select>
+          Action
+          <select id="auditActionSelect" name="action"></select>
+        </label>
+        <label>
+          Actor type
+          <select id="auditActorTypeSelect" name="actor_type"></select>
         </label>
         <button type="submit" class="secondary">Apply</button>
       </form>
@@ -2222,30 +2414,28 @@ def get_dashboard_html():
     const inventoryFields = ["device_id", "display_name", "detected_name", "detected_id", "version", "source", "is_catalog_match", "last_seen_at"];
     const requestFields = ["request_id", "company_name", "target_device_id", "app", "action", "requested_by_username", "status", "linked_job_id", "created_at"];
     const jobFields = ["id", "company_name", "device_id", "app", "action", "status", "attempts", "message", "started_at", "finished_at"];
-    const auditFields = ["created_at", "event_type", "company_name", "actor_username", "actor_role", "target_label", "message"];
-    const auditEventTypes = [
+    const auditFields = ["created_at", "tenant_id", "company_name", "actor_name", "actor_type", "action", "target_type", "target_id", "message"];
+    const auditActions = [
       "ALL",
-      "USER_LOGIN_SUCCESS",
-      "USER_LOGIN_FAILED",
-      "USER_LOGOUT",
-      "DEVICE_ENROLLED",
-      "DEVICE_HEARTBEAT_FIRST_SEEN",
-      "DEVICE_APPROVED",
-      "DEVICE_REJECTED",
-      "APP_REQUEST_CREATED",
-      "APP_REQUEST_APPROVED",
-      "APP_REQUEST_REJECTED",
-      "JOB_CREATED",
-      "JOB_STARTED",
-      "JOB_SUCCESS",
-      "JOB_FAILED",
-      "JOB_SKIPPED",
-      "INVENTORY_SCAN_STARTED",
-      "INVENTORY_SCAN_SUCCESS",
-      "INVENTORY_SCAN_FAILED",
-      "INVENTORY_UPDATED",
-      "UNAUTHORIZED_ACCESS_ATTEMPT",
+      "tenant_created",
+      "tenant_updated",
+      "device_enrolled",
+      "device_approved",
+      "device_rejected",
+      "device_check_in",
+      "ticket_created",
+      "ticket_approved",
+      "ticket_rejected",
+      "job_created",
+      "job_started",
+      "job_success",
+      "job_failed",
+      "job_skipped",
+      "user_login_success",
+      "user_login_failed",
+      "user_logout",
     ];
+    const auditActorTypes = ["ALL", "system_admin", "company_admin", "user", "agent", "system"];
     let currentUser = null;
     let lastCompanies = [];
     let lastDevices = [];
@@ -2463,20 +2653,25 @@ def get_dashboard_html():
       if (companyOptions.includes(currentCompany)) {
         auditCompanySelect.value = currentCompany;
       }
-      populateSelect("auditEventSelect", auditEventTypes);
+      populateSelect("auditActionSelect", auditActions);
+      populateSelect("auditActorTypeSelect", auditActorTypes);
     }
 
     function getAuditPath() {
       const params = new URLSearchParams({ limit: "100" });
       const companyId = document.getElementById("auditCompanySelect").value;
-      const eventType = document.getElementById("auditEventSelect").value;
+      const action = document.getElementById("auditActionSelect").value;
+      const actorType = document.getElementById("auditActorTypeSelect").value;
       if (companyId && companyId !== "ALL") {
-        params.set("company_id", companyId);
+        params.set("tenant_id", companyId);
       }
-      if (eventType && eventType !== "ALL") {
-        params.set("event_type", eventType);
+      if (action && action !== "ALL") {
+        params.set("action", action);
       }
-      return `/api/audit-logs?${params.toString()}`;
+      if (actorType && actorType !== "ALL") {
+        params.set("actor_type", actorType);
+      }
+      return `/api/admin/audit-logs?${params.toString()}`;
     }
 
     function applyRoleUi() {
@@ -2817,7 +3012,7 @@ def dashboard_companies(request: Request):
 def dashboard_create_company(request: Request, payload: CreateTenantRequest):
     user = get_current_user(request)
     require_role(user, {"system_admin"})
-    return create_company(payload)
+    return create_company(payload, actor=user)
 
 
 @app.get("/dashboard/api/devices")
@@ -2932,6 +3127,91 @@ def get_audit_logs(
     )
     safe_limit = max(1, min(int(limit or 100), 500))
     return sorted_logs[:safe_limit]
+
+
+def get_activity_history(
+    user=None,
+    tenant_id: Optional[str] = None,
+    actor_type: Optional[str] = None,
+    action: Optional[str] = None,
+    target_type: Optional[str] = None,
+    target_id: Optional[str] = None,
+    limit: int = 100,
+):
+    audit_logs = [normalize_audit_record(entry) for entry in load_audit_logs()]
+    if user is not None and user.get("role") != "system_admin":
+        audit_logs = [
+            entry
+            for entry in audit_logs
+            if isinstance(entry, dict) and entry.get("tenant_id") == user.get("company_id")
+        ]
+    if tenant_id:
+        if user is not None:
+            assert_company_access(user, tenant_id)
+        audit_logs = [
+            entry
+            for entry in audit_logs
+            if isinstance(entry, dict) and entry.get("tenant_id") == tenant_id
+        ]
+    if actor_type:
+        audit_logs = [
+            entry
+            for entry in audit_logs
+            if isinstance(entry, dict) and entry.get("actor_type") == actor_type
+        ]
+    if action:
+        audit_logs = [
+            entry
+            for entry in audit_logs
+            if isinstance(entry, dict) and entry.get("action") == action
+        ]
+    if target_type:
+        audit_logs = [
+            entry
+            for entry in audit_logs
+            if isinstance(entry, dict) and entry.get("target_type") == target_type
+        ]
+    if target_id:
+        audit_logs = [
+            entry
+            for entry in audit_logs
+            if isinstance(entry, dict) and entry.get("target_id") == target_id
+        ]
+    sorted_logs = sorted(
+        audit_logs,
+        key=lambda entry: entry.get("created_at", "") if isinstance(entry, dict) else "",
+        reverse=True,
+    )
+    safe_limit = max(1, min(int(limit or 100), 500))
+    return sorted_logs[:safe_limit]
+
+
+@app.get("/api/admin/audit-logs")
+def get_admin_audit_logs(
+    request: Request,
+    tenant_id: Optional[str] = None,
+    actor_type: Optional[str] = None,
+    action: Optional[str] = None,
+    target_type: Optional[str] = None,
+    target_id: Optional[str] = None,
+    limit: int = 100,
+):
+    user = get_optional_user(request)
+    return get_activity_history(
+        user=user,
+        tenant_id=tenant_id,
+        actor_type=actor_type,
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        limit=limit,
+    )
+
+
+@app.get("/api/admin/tenants/{tenant_id}/audit-logs")
+def get_tenant_audit_logs(request: Request, tenant_id: str, limit: int = 100):
+    user = get_optional_user(request)
+    return get_activity_history(user=user, tenant_id=tenant_id, limit=limit)
 
 
 @app.post("/api/agent/inventory")
@@ -3092,7 +3372,7 @@ def get_tenant(tenant_id: str):
 
 
 @app.patch("/api/admin/tenants/{tenant_id}")
-def update_tenant(tenant_id: str, request: UpdateTenantRequest):
+def update_tenant(tenant_id: str, request: UpdateTenantRequest, actor=None):
     tenants = load_tenants()
     for tenant in tenants:
         if isinstance(tenant, dict) and (
@@ -3107,14 +3387,24 @@ def update_tenant(tenant_id: str, request: UpdateTenantRequest):
 
             tenant["updated_at"] = utc_now()
             save_tenants(tenants)
+            log_audit(
+                "TENANT_UPDATED",
+                f"Company {tenant.get('company_name')} was updated.",
+                company_id=tenant.get("company_id"),
+                company_name=tenant.get("company_name"),
+                actor=actor,
+                target_type="tenant",
+                target_label=tenant.get("company_id"),
+                metadata={"company_name": tenant.get("company_name"), "status": tenant.get("status")},
+            )
             return tenant
 
     raise HTTPException(status_code=404, detail="Tenant not found")
 
 
 @app.post("/api/admin/companies")
-def create_company(request: CreateTenantRequest):
-    return get_or_create_company(request.company_name)
+def create_company(request: CreateTenantRequest, actor=None):
+    return get_or_create_company(request.company_name, actor=actor)
 
 
 @app.get("/api/admin/companies")

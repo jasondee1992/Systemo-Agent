@@ -1083,6 +1083,80 @@ python .\agent_cli.py api-device-inventory <device_id>
 
 The previously submitted inventory should still be present.
 
+## Phase 15 Audit Logs and Activity History
+
+The mock backend records activity history for tenant, device, ticket, and job actions. SQLite remains the primary store, and a Phase 15 JSON mirror is written to:
+
+```text
+mock_backend/audit_logs.json
+```
+
+Each activity record includes:
+
+- `audit_id`
+- `tenant_id`
+- `actor_type`
+- `actor_id`
+- `actor_name`
+- `action`
+- `target_type`
+- `target_id`
+- `message`
+- `details`
+- `created_at`
+
+Audit API endpoints:
+
+```text
+GET /api/admin/audit-logs
+GET /api/admin/tenants/{tenant_id}/audit-logs
+```
+
+Supported filters on `/api/admin/audit-logs`:
+
+- `tenant_id`
+- `actor_type`
+- `action`
+- `target_type`
+- `target_id`
+- `limit`
+
+List audit logs from the CLI:
+
+```powershell
+python .\agent_cli.py api-list-audit-logs
+python .\agent_cli.py api-list-audit-logs --tenant-id ybalai-builders
+python .\agent_cli.py api-list-audit-logs --limit 20
+```
+
+Dashboard:
+
+```text
+http://127.0.0.1:8008
+```
+
+Open the Audit Logs section to filter by tenant, action, and actor type.
+
+Audit test flow:
+
+```powershell
+python .\mock_server.py
+python .\agent_cli.py api-create-tenant "Ybalai Builders"
+python .\agent_cli.py install-agent --company "Ybalai Builders" --api-url "http://127.0.0.1:8008"
+python .\agent_cli.py api-list-devices
+python .\agent_cli.py api-approve-device <device_id>
+python .\agent_cli.py api-add-job 7zip install
+Start-Sleep -Seconds 45
+python .\agent_cli.py api-list-jobs
+python .\agent_cli.py api-list-audit-logs --tenant-id ybalai-builders --limit 20
+python .\agent_cli.py api-add-job 7zip uninstall
+Start-Sleep -Seconds 45
+python .\agent_cli.py api-list-jobs
+python .\agent_cli.py api-list-audit-logs --tenant-id ybalai-builders --limit 20
+```
+
+Expected actions include `tenant_created`, `device_enrolled`, `device_approved`, `job_created`, `job_started`, and either `job_success`, `job_failed`, or `job_skipped`.
+
 To test VLC detection after uninstall:
 
 ```powershell
