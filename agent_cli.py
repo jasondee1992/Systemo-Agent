@@ -24,6 +24,7 @@ from agent import (
 BASE_DIR = Path(__file__).resolve().parent
 CATALOG_FILE = BASE_DIR / "app_catalog.json"
 JOBS_FILE = BASE_DIR / "jobs.json"
+AUTH_FILE = BASE_DIR / "config" / "mock_auth.json"
 AGENT_LOG_FILE = BASE_DIR / "logs" / "agent.log"
 INSTALL_TASK_SCRIPT = BASE_DIR / "scripts" / "install_task.ps1"
 UNINSTALL_TASK_SCRIPT = BASE_DIR / "scripts" / "uninstall_task.ps1"
@@ -86,6 +87,15 @@ TENANT_DISPLAY_FIELDS = [
     "created_at",
     "updated_at",
 ]
+USER_DISPLAY_FIELDS = [
+    "user_id",
+    "email",
+    "full_name",
+    "role",
+    "tenant_id",
+    "status",
+    "last_login_at",
+]
 
 
 def load_json(path, default):
@@ -126,6 +136,26 @@ def get_requests_module():
 
 def get_api_base_url(config):
     return str(config.get("api_base_url") or DEFAULT_API_BASE_URL).rstrip("/")
+
+
+def load_auth():
+    auth = load_json(AUTH_FILE, {})
+    return auth if isinstance(auth, dict) else {}
+
+
+def save_auth(auth):
+    AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+    save_json(AUTH_FILE, auth)
+
+
+def get_auth_headers(required=False):
+    auth = load_auth()
+    token = auth.get("access_token")
+    if not token:
+        if required:
+            raise ValueError("Not logged in. Run: python agent_cli.py api-login admin@systemo.local admin123")
+        return {}
+    return {"Authorization": f"Bearer {token}"}
 
 
 def normalize_api_url(api_url):
@@ -452,6 +482,92 @@ def set_mode(mode):
     print(f"Job source set to {mode}.")
 
 
+def print_user(user):
+    if not isinstance(user, dict):
+        print("- Invalid user entry")
+        return
+
+    print(f"- {get_job_value(user, 'email')}")
+    for field in USER_DISPLAY_FIELDS:
+        if field == "email":
+            continue
+        print(f"  {field}: {get_job_value(user, field)}")
+
+
+def print_users(users):
+    if not users:
+        print("No users found.")
+        return
+
+    for user in users:
+        print_user(user)
+
+
+def api_login(email, password):
+    config = load_or_create_agent_config()
+    requests = get_requests_module()
+    response = requests.post(
+        f"{get_api_base_url(config)}/api/auth/login",
+        json={"email": email, "password": password},
+        timeout=10,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    token = payload.get("access_token")
+    user = payload.get("user") or {}
+    if not token:
+        raise ValueError("Login response did not include an access token")
+    save_auth({"access_token": token, "user": user, "api_base_url": get_api_base_url(config)})
+    print(f"Logged in as {user.get('email') or email} ({user.get('role') or '-'})")
+
+
+def api_me():
+    config = load_or_create_agent_config()
+    requests = get_requests_module()
+    response = requests.get(
+        f"{get_api_base_url(config)}/api/auth/me",
+        headers=get_auth_headers(required=True),
+        timeout=10,
+    )
+    response.raise_for_status()
+    print_user((response.json() or {}).get("user") or {})
+
+
+def api_create_user(tenant_id, email, password, full_name, role):
+    config = load_or_create_agent_config()
+    requests = get_requests_module()
+    response = requests.post(
+        f"{get_api_base_url(config)}/api/admin/users",
+        headers=get_auth_headers(required=True),
+        json={
+            "tenant_id": tenant_id,
+            "email": email,
+            "password": password,
+            "full_name": full_name,
+            "role": role,
+        },
+        timeout=10,
+    )
+    response.raise_for_status()
+    user = response.json()
+    print(f"Created user {user.get('email')} ({user.get('role')}).")
+
+
+def api_list_users():
+    config = load_or_create_agent_config()
+    requests = get_requests_module()
+    response = requests.get(
+        f"{get_api_base_url(config)}/api/admin/users",
+        headers=get_auth_headers(required=True),
+        timeout=10,
+    )
+    response.raise_for_status()
+    users = response.json()
+    if not isinstance(users, list):
+        raise ValueError("API users response must be a JSON array")
+    print_users(users)
+
+
 def api_add_job(app, action="install"):
     validate_app_action(app, action)
 
@@ -464,6 +580,7 @@ def api_add_job(app, action="install"):
         payload["company_name"] = config.get("company_name")
     response = requests.post(
         f"{get_api_base_url(config)}/api/agent/jobs",
+        headers=get_auth_headers(required=True),
         json=payload,
         timeout=10,
     )
@@ -475,7 +592,11 @@ def api_add_job(app, action="install"):
 def api_list_jobs():
     config = load_or_create_agent_config()
     requests = get_requests_module()
-    response = requests.get(f"{get_api_base_url(config)}/api/agent/jobs/all", timeout=10)
+    response = requests.get(
+        f"{get_api_base_url(config)}/api/agent/jobs/all",
+        headers=get_auth_headers(required=True),
+        timeout=10,
+    )
     response.raise_for_status()
     jobs = response.json()
     if not isinstance(jobs, list):
@@ -492,7 +613,11 @@ def api_clear_jobs(yes=False):
 
     config = load_or_create_agent_config()
     requests = get_requests_module()
-    response = requests.delete(f"{get_api_base_url(config)}/api/agent/jobs/all", timeout=10)
+    response = requests.delete(
+        f"{get_api_base_url(config)}/api/agent/jobs/all",
+        headers=get_auth_headers(required=True),
+        timeout=10,
+    )
     response.raise_for_status()
     result = response.json()
     removed_count = result.get("removed")
@@ -523,7 +648,11 @@ def print_devices(devices):
 def api_list_devices():
     config = load_or_create_agent_config()
     requests = get_requests_module()
-    response = requests.get(f"{get_api_base_url(config)}/api/devices", timeout=10)
+    response = requests.get(
+        f"{get_api_base_url(config)}/api/devices",
+        headers=get_auth_headers(required=True),
+        timeout=10,
+    )
     response.raise_for_status()
     devices = response.json()
     if not isinstance(devices, list):
@@ -534,7 +663,11 @@ def api_list_devices():
 def api_show_device(device_id):
     config = load_or_create_agent_config()
     requests = get_requests_module()
-    response = requests.get(f"{get_api_base_url(config)}/api/devices/{device_id}", timeout=10)
+    response = requests.get(
+        f"{get_api_base_url(config)}/api/devices/{device_id}",
+        headers=get_auth_headers(required=True),
+        timeout=10,
+    )
     response.raise_for_status()
     device = response.json()
     print_device(device)
@@ -562,7 +695,11 @@ def print_companies(companies):
 def api_list_companies():
     config = load_or_create_agent_config()
     requests = get_requests_module()
-    response = requests.get(f"{get_api_base_url(config)}/api/admin/companies", timeout=10)
+    response = requests.get(
+        f"{get_api_base_url(config)}/api/admin/companies",
+        headers=get_auth_headers(required=True),
+        timeout=10,
+    )
     response.raise_for_status()
     companies = response.json()
     if not isinstance(companies, list):
@@ -575,6 +712,7 @@ def api_approve_device(device_id):
     requests = get_requests_module()
     response = requests.post(
         f"{get_api_base_url(config)}/api/admin/devices/{device_id}/approve",
+        headers=get_auth_headers(required=True),
         timeout=10,
     )
     response.raise_for_status()
@@ -587,6 +725,7 @@ def api_reject_device(device_id):
     requests = get_requests_module()
     response = requests.post(
         f"{get_api_base_url(config)}/api/admin/devices/{device_id}/reject",
+        headers=get_auth_headers(required=True),
         timeout=10,
     )
     response.raise_for_status()
@@ -618,6 +757,7 @@ def api_create_tenant(company_name):
     requests = get_requests_module()
     response = requests.post(
         f"{get_api_base_url(config)}/api/admin/tenants",
+        headers=get_auth_headers(required=True),
         json={"company_name": company_name},
         timeout=10,
     )
@@ -629,7 +769,11 @@ def api_create_tenant(company_name):
 def api_list_tenants():
     config = load_or_create_agent_config()
     requests = get_requests_module()
-    response = requests.get(f"{get_api_base_url(config)}/api/admin/tenants", timeout=10)
+    response = requests.get(
+        f"{get_api_base_url(config)}/api/admin/tenants",
+        headers=get_auth_headers(required=True),
+        timeout=10,
+    )
     response.raise_for_status()
     tenants = response.json()
     if not isinstance(tenants, list):
@@ -640,7 +784,11 @@ def api_list_tenants():
 def api_show_tenant(tenant_id):
     config = load_or_create_agent_config()
     requests = get_requests_module()
-    response = requests.get(f"{get_api_base_url(config)}/api/admin/tenants/{tenant_id}", timeout=10)
+    response = requests.get(
+        f"{get_api_base_url(config)}/api/admin/tenants/{tenant_id}",
+        headers=get_auth_headers(required=True),
+        timeout=10,
+    )
     response.raise_for_status()
     tenant = response.json()
     print_tenant(tenant)
@@ -660,6 +808,7 @@ def api_update_tenant(tenant_id, company_name=None, status=None):
     requests = get_requests_module()
     response = requests.patch(
         f"{get_api_base_url(config)}/api/admin/tenants/{tenant_id}",
+        headers=get_auth_headers(required=True),
         json=payload,
         timeout=10,
     )
@@ -700,6 +849,7 @@ def api_list_audit_logs(tenant_id=None, limit=100):
         params["tenant_id"] = tenant_id
     response = requests.get(
         f"{get_api_base_url(config)}/api/admin/audit-logs",
+        headers=get_auth_headers(required=True),
         params=params,
         timeout=10,
     )
@@ -1026,6 +1176,21 @@ def build_parser():
     set_mode_parser = subparsers.add_parser("set-mode", help="Set job source mode")
     set_mode_parser.add_argument("mode", choices=["local", "api"])
 
+    api_login_parser = subparsers.add_parser("api-login", help="Login to the mock API")
+    api_login_parser.add_argument("email")
+    api_login_parser.add_argument("password")
+
+    subparsers.add_parser("api-me", help="Show the logged-in mock API user")
+
+    api_create_user_parser = subparsers.add_parser("api-create-user", help="Create a mock API dashboard user")
+    api_create_user_parser.add_argument("--tenant-id")
+    api_create_user_parser.add_argument("--email", required=True)
+    api_create_user_parser.add_argument("--password", required=True)
+    api_create_user_parser.add_argument("--full-name", required=True)
+    api_create_user_parser.add_argument("--role", choices=["system_admin", "company_admin"], required=True)
+
+    subparsers.add_parser("api-list-users", help="List mock API dashboard users")
+
     api_add_job_parser = subparsers.add_parser("api-add-job", help="Create an approved mock API job")
     api_add_job_parser.add_argument("app")
     api_add_job_parser.add_argument("action", nargs="?", default="install", choices=sorted(ALLOWED_ACTIONS))
@@ -1110,6 +1275,14 @@ def main():
             register_company(args.company)
         elif args.command == "set-mode":
             set_mode(args.mode)
+        elif args.command == "api-login":
+            api_login(args.email, args.password)
+        elif args.command == "api-me":
+            api_me()
+        elif args.command == "api-create-user":
+            api_create_user(args.tenant_id, args.email, args.password, args.full_name, args.role)
+        elif args.command == "api-list-users":
+            api_list_users()
         elif args.command == "api-add-job":
             api_add_job(args.app, args.action)
         elif args.command == "api-list-jobs":

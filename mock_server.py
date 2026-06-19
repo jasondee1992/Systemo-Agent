@@ -38,9 +38,11 @@ ALLOWED_APPS = {"vlc", "chrome", "7zip"}
 ALLOWED_ACTIONS = {"install", "uninstall"}
 TENANT_STATUSES = {"active", "inactive"}
 USER_ROLES = {"system_admin", "company_admin", "viewer"}
+ADMIN_USER_ROLES = {"system_admin", "company_admin"}
 APP_REQUEST_STATUSES = {"pending", "approved", "rejected", "converted_to_job"}
 SESSION_COOKIE_NAME = "systemo_session"
 SESSIONS = {}
+AUTH_TOKENS = {}
 
 init_database()
 app = FastAPI(title="Systemo Agent Mock Backend")
@@ -85,8 +87,17 @@ class UpdateTenantRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    username: str
+    email: Optional[str] = None
+    username: Optional[str] = None
     password: str
+
+
+class CreateUserRequest(BaseModel):
+    tenant_id: Optional[str] = None
+    email: str
+    password: str
+    full_name: str
+    role: str = "company_admin"
 
 
 class CreateAppRequestRequest(BaseModel):
@@ -180,7 +191,9 @@ AUDIT_EVENT_ACTIONS = {
     "TENANT_CREATED": "tenant_created",
     "TENANT_UPDATED": "tenant_updated",
     "USER_LOGIN_FAILED": "user_login_failed",
-    "USER_LOGIN_SUCCESS": "user_login_success",
+    "USER_LOGIN_SUCCESS": "user_login",
+    "USER_CREATED": "user_created",
+    "UNAUTHORIZED_ACCESS_ATTEMPT": "unauthorized_access_attempt",
     "USER_LOGOUT": "user_logout",
 }
 
@@ -1356,6 +1369,7 @@ def get_company_from_request(company_id=None, company_name=None, create_if_missi
 
 
 def hash_password(password):
+    # Prototype-only password hashing. Production should use a slow salted hash.
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
@@ -1377,58 +1391,114 @@ def save_users(users):
         for user in users:
             if not isinstance(user, dict) or not user.get("user_id"):
                 continue
+            email = (user.get("email") or user.get("username") or "").strip().lower()
+            username = (user.get("username") or email).strip()
+            full_name = (user.get("full_name") or username or email).strip()
+            company_id = user.get("tenant_id") if user.get("tenant_id") is not None else user.get("company_id")
+            password_hash = user.get("password_hash") or hash_password(user.get("password") or "")
+            user["email"] = email
+            user["username"] = username
+            user["full_name"] = full_name
+            user["company_id"] = company_id
+            user["tenant_id"] = company_id
+            user["password_hash"] = password_hash
+            user["status"] = user.get("status") or "active"
             row = session.get(User, user.get("user_id"))
             if row is None:
                 row = User(
                     user_id=user.get("user_id"),
-                    username=user.get("username"),
-                    password_hash=user.get("password_hash"),
+                    username=username,
+                    email=email,
+                    password_hash=password_hash,
+                    full_name=full_name,
                     role=user.get("role"),
+                    company_id=company_id,
+                    status=user.get("status") or "active",
                     created_at=user.get("created_at") or now,
                     updated_at=user.get("updated_at") or now,
+                    last_login_at=user.get("last_login_at"),
                 )
                 session.add(row)
 
-            row.username = user.get("username")
-            row.password_hash = user.get("password_hash")
+            row.username = username
+            row.email = email
+            row.password_hash = password_hash
+            row.full_name = full_name
             row.role = user.get("role")
-            row.company_id = user.get("company_id")
+            row.company_id = company_id
+            row.status = user.get("status") or "active"
             row.created_at = user.get("created_at") or row.created_at or now
             row.updated_at = user.get("updated_at") or now
+            row.last_login_at = user.get("last_login_at")
+
+    BACKEND_DIR.mkdir(parents=True, exist_ok=True)
+    with USERS_FILE.open("w", encoding="utf-8") as file:
+        json.dump([public_user_for_storage(user) for user in users if isinstance(user, dict)], file, indent=2)
+        file.write("\n")
 
 
 def seed_default_users():
-    ybalai_company = get_or_create_company("Ybalai Builders")
     now = utc_now()
     users = [
         {
             "user_id": "user-admin",
-            "username": "admin",
+            "username": "admin@systemo.local",
+            "email": "admin@systemo.local",
             "password_hash": hash_password("admin123"),
+            "full_name": "System Admin",
             "role": "system_admin",
             "company_id": None,
+            "tenant_id": None,
+            "status": "active",
             "created_at": now,
             "updated_at": now,
-        },
-        {
-            "user_id": "user-ybalai-admin",
-            "username": "ybalai_admin",
-            "password_hash": hash_password("admin123"),
-            "role": "company_admin",
-            "company_id": ybalai_company.get("company_id"),
-            "created_at": now,
-            "updated_at": now,
-        },
-        {
-            "user_id": "user-ybalai-viewer",
-            "username": "ybalai_viewer",
-            "password_hash": hash_password("admin123"),
-            "role": "viewer",
-            "company_id": ybalai_company.get("company_id"),
-            "created_at": now,
-            "updated_at": now,
+            "last_login_at": None,
         },
     ]
+    save_users(users)
+    return users
+
+
+def public_user_for_storage(user):
+    tenant_id = user.get("tenant_id") if user.get("tenant_id") is not None else user.get("company_id")
+    email = user.get("email") or user.get("username")
+    return {
+        "user_id": user.get("user_id"),
+        "tenant_id": tenant_id,
+        "company_id": tenant_id,
+        "email": email,
+        "username": user.get("username") or email,
+        "password_hash": user.get("password_hash"),
+        "full_name": user.get("full_name") or user.get("username") or email,
+        "role": user.get("role"),
+        "status": user.get("status") or "active",
+        "created_at": user.get("created_at"),
+        "updated_at": user.get("updated_at"),
+        "last_login_at": user.get("last_login_at"),
+    }
+
+
+def ensure_phase16_default_admin(users):
+    if any((user.get("email") or "").lower() == "admin@systemo.local" for user in users if isinstance(user, dict)):
+        return users
+
+    now = utc_now()
+    users.append(
+        {
+            "user_id": "user-admin-email",
+            "username": "admin@systemo.local",
+            "email": "admin@systemo.local",
+            "password_hash": hash_password("admin123"),
+            "full_name": "System Admin",
+            "role": "system_admin",
+            "company_id": None,
+            "tenant_id": None,
+            "status": "active",
+            "created_at": now,
+            "updated_at": now,
+            "last_login_at": None,
+        }
+    )
     save_users(users)
     return users
 
@@ -1440,7 +1510,7 @@ def load_users():
     if not users:
         return seed_default_users()
 
-    return users
+    return ensure_phase16_default_admin(users)
 
 
 def safe_load_json_array(path):
@@ -1488,24 +1558,71 @@ initialize_persistent_data()
 
 
 def public_user(user):
+    tenant_id = user.get("tenant_id") if user.get("tenant_id") is not None else user.get("company_id")
+    email = user.get("email") or user.get("username")
     return {
         "user_id": user.get("user_id"),
-        "username": user.get("username"),
+        "username": user.get("username") or email,
+        "email": email,
+        "full_name": user.get("full_name") or user.get("username") or email,
         "role": user.get("role"),
-        "company_id": user.get("company_id"),
+        "status": user.get("status") or "active",
+        "tenant_id": tenant_id,
+        "company_id": tenant_id,
+        "created_at": user.get("created_at"),
+        "last_login_at": user.get("last_login_at"),
     }
 
 
-def authenticate_user(username, password):
+def authenticate_user(identifier, password):
+    normalized_identifier = (identifier or "").strip().lower()
     for user in load_users():
-        if user.get("username") == username and user.get("password_hash") == hash_password(password):
+        candidates = {
+            (user.get("username") or "").strip().lower(),
+            (user.get("email") or "").strip().lower(),
+        }
+        if normalized_identifier in candidates and user.get("password_hash") == hash_password(password):
             if user.get("role") not in USER_ROLES:
                 raise HTTPException(status_code=403, detail="Invalid user role")
+            if (user.get("status") or "active") != "active":
+                raise HTTPException(status_code=403, detail="User is inactive")
+            return user
+    return None
+
+
+def issue_access_token(user):
+    token = secrets.token_urlsafe(32)
+    AUTH_TOKENS[token] = user.get("user_id")
+    return token
+
+
+def get_bearer_token(request: Request):
+    authorization = request.headers.get("authorization") or ""
+    if not authorization.lower().startswith("bearer "):
+        return None
+    return authorization.split(" ", 1)[1].strip()
+
+
+def find_user_by_id(user_id):
+    for user in load_users():
+        if user.get("user_id") == user_id:
             return user
     return None
 
 
 def get_current_user(request: Request):
+    token = get_bearer_token(request)
+    if token:
+        user_id = AUTH_TOKENS.get(token)
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        user = find_user_by_id(user_id)
+        if user is None:
+            raise HTTPException(status_code=401, detail="User not found")
+        if (user.get("status") or "active") != "active":
+            raise HTTPException(status_code=403, detail="User is inactive")
+        return user
+
     session_id = request.cookies.get(SESSION_COOKIE_NAME)
     if not session_id:
         raise HTTPException(status_code=401, detail="Authentication required")
@@ -1514,9 +1631,11 @@ def get_current_user(request: Request):
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid session")
 
-    for user in load_users():
-        if user.get("user_id") == user_id:
-            return user
+    user = find_user_by_id(user_id)
+    if user is not None:
+        if (user.get("status") or "active") != "active":
+            raise HTTPException(status_code=403, detail="User is inactive")
+        return user
 
     raise HTTPException(status_code=401, detail="User not found")
 
@@ -1526,6 +1645,12 @@ def get_optional_user(request: Request):
         return get_current_user(request)
     except HTTPException:
         return None
+
+
+def get_user_if_credentials_present(request: Request):
+    if get_bearer_token(request) or request.cookies.get(SESSION_COOKIE_NAME):
+        return get_current_user(request)
+    return None
 
 
 def set_session_cookie(response: Response, user):
@@ -1544,6 +1669,24 @@ def clear_session_cookie(request: Request, response: Response):
     if session_id:
         SESSIONS.pop(session_id, None)
     response.delete_cookie(SESSION_COOKIE_NAME)
+
+
+def revoke_bearer_token(request: Request):
+    token = get_bearer_token(request)
+    if token:
+        AUTH_TOKENS.pop(token, None)
+
+
+def update_user_last_login(user):
+    users = load_users()
+    login_time = utc_now()
+    for entry in users:
+        if isinstance(entry, dict) and entry.get("user_id") == user.get("user_id"):
+            entry["last_login_at"] = login_time
+            entry["updated_at"] = login_time
+            save_users(users)
+            return entry
+    return user
 
 
 def require_role(user, allowed_roles):
@@ -1936,8 +2079,8 @@ def get_login_html():
     <h1>Systemo Agent Console</h1>
     <form id="loginForm">
       <label>
-        Username
-        <input id="username" autocomplete="username" required>
+        Email
+        <input id="username" autocomplete="username" value="admin@systemo.local" required>
       </label>
       <label>
         Password
@@ -1952,19 +2095,23 @@ def get_login_html():
       event.preventDefault();
       const message = document.getElementById("message");
       message.textContent = "";
-      const response = await fetch("/api/login", {
+      const response = await fetch("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          username: document.getElementById("username").value,
+          email: document.getElementById("username").value,
           password: document.getElementById("password").value,
         }),
       });
       if (response.ok) {
+        const result = await response.json();
+        if (result.access_token) {
+          localStorage.setItem("systemo_access_token", result.access_token);
+        }
         window.location.href = "/";
         return;
       }
-      message.textContent = "Invalid username or password.";
+      message.textContent = "Invalid email or password.";
     });
   </script>
 </body>
@@ -2453,7 +2600,13 @@ def get_dashboard_html():
     }
 
     async function fetchJson(path, options) {
-      const response = await fetch(path, options);
+      const requestOptions = options ? { ...options } : {};
+      requestOptions.headers = { ...(requestOptions.headers || {}) };
+      const token = localStorage.getItem("systemo_access_token");
+      if (token) {
+        requestOptions.headers.Authorization = `Bearer ${token}`;
+      }
+      const response = await fetch(path, requestOptions);
       if (!response.ok) {
         const text = await response.text();
         throw new Error(text || `${response.status} ${response.statusText}`);
@@ -2882,7 +3035,12 @@ def get_dashboard_html():
 
     document.getElementById("refreshButton").addEventListener("click", refreshAll);
     document.getElementById("logoutButton").addEventListener("click", async () => {
-      await fetch("/logout", { method: "POST" });
+      const token = localStorage.getItem("systemo_access_token");
+      await fetch("/api/auth/logout", {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      localStorage.removeItem("systemo_access_token");
       window.location.href = "/login";
     });
     document.getElementById("companySelect").addEventListener("change", refreshFormOptions);
@@ -2943,44 +3101,144 @@ def login_page(request: Request):
 
 @app.post("/api/login")
 def login(request: LoginRequest):
-    user = authenticate_user(request.username, request.password)
+    return login_with_credentials(request)
+
+
+@app.post("/api/auth/login")
+def auth_login(request: LoginRequest):
+    return login_with_credentials(request)
+
+
+def login_with_credentials(request: LoginRequest):
+    identifier = request.email or request.username
+    if not identifier:
+        raise HTTPException(status_code=400, detail="email is required")
+
+    user = authenticate_user(identifier, request.password)
     if user is None:
         log_audit(
             "USER_LOGIN_FAILED",
-            f"Login failed for username {request.username}",
+            f"Login failed for {identifier}",
             target_type="user",
-            target_label=request.username,
-            metadata={"username": request.username},
+            target_label=identifier,
+            metadata={"email": identifier},
         )
-        raise HTTPException(status_code=401, detail="Invalid username or password")
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    user = update_user_last_login(user)
+    token = issue_access_token(user)
     log_audit(
         "USER_LOGIN_SUCCESS",
-        f"User {user.get('username')} logged in",
+        f"User {user.get('email') or user.get('username')} logged in",
         company_id=user.get("company_id"),
         actor=user,
         target_type="user",
-        target_label=user.get("username"),
+        target_label=user.get("email") or user.get("username"),
     )
-    response = JSONResponse({"user": public_user(user)})
+    response = JSONResponse({"access_token": token, "token_type": "bearer", "user": public_user(user)})
     set_session_cookie(response, user)
     return response
 
 
 @app.post("/logout")
 def logout(request: Request):
+    return auth_logout(request)
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request):
     user = get_optional_user(request)
     if user is not None:
         log_audit(
             "USER_LOGOUT",
-            f"User {user.get('username')} logged out",
+            f"User {user.get('email') or user.get('username')} logged out",
             company_id=user.get("company_id"),
             actor=user,
             target_type="user",
-            target_label=user.get("username"),
+            target_label=user.get("email") or user.get("username"),
         )
     response = JSONResponse({"status": "ok"})
+    revoke_bearer_token(request)
     clear_session_cookie(request, response)
     return response
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request):
+    return {"user": public_user(get_current_user(request))}
+
+
+def create_admin_user(payload: CreateUserRequest, actor):
+    require_role(actor, {"system_admin"})
+
+    role = (payload.role or "").strip()
+    if role not in ADMIN_USER_ROLES:
+        raise HTTPException(status_code=400, detail="role must be system_admin or company_admin")
+
+    email = (payload.email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="email is required")
+    if not payload.password:
+        raise HTTPException(status_code=400, detail="password is required")
+
+    tenant_id = payload.tenant_id
+    if role == "company_admin":
+        if not tenant_id:
+            raise HTTPException(status_code=400, detail="tenant_id is required for company_admin")
+        if find_company_by_id(load_tenants(), tenant_id) is None:
+            raise HTTPException(status_code=404, detail="Tenant not found")
+    else:
+        tenant_id = None
+
+    users = load_users()
+    if any((user.get("email") or user.get("username") or "").strip().lower() == email for user in users):
+        raise HTTPException(status_code=400, detail="User email already exists")
+
+    now = utc_now()
+    user = {
+        "user_id": f"user-{uuid.uuid4().hex[:12]}",
+        "tenant_id": tenant_id,
+        "company_id": tenant_id,
+        "email": email,
+        "username": email,
+        "password_hash": hash_password(payload.password),
+        "full_name": payload.full_name.strip() or email,
+        "role": role,
+        "status": "active",
+        "created_at": now,
+        "updated_at": now,
+        "last_login_at": None,
+    }
+    users.append(user)
+    save_users(users)
+    log_audit(
+        "USER_CREATED",
+        f"User {email} was created",
+        company_id=tenant_id,
+        actor=actor,
+        target_type="user",
+        target_label=email,
+        metadata={"role": role, "tenant_id": tenant_id},
+    )
+    return public_user(user)
+
+
+@app.post("/api/admin/users")
+def create_user(request: Request, payload: CreateUserRequest):
+    return create_admin_user(payload, get_current_user(request))
+
+
+@app.get("/api/admin/users")
+def list_users(request: Request):
+    user = get_current_user(request)
+    require_role(user, ADMIN_USER_ROLES)
+    users = load_users()
+    if user.get("role") != "system_admin":
+        users = [
+            entry
+            for entry in users
+            if isinstance(entry, dict) and entry.get("company_id") == user.get("company_id")
+        ]
+    return [public_user(entry) for entry in users if isinstance(entry, dict)]
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -3196,7 +3454,7 @@ def get_admin_audit_logs(
     target_id: Optional[str] = None,
     limit: int = 100,
 ):
-    user = get_optional_user(request)
+    user = get_current_user(request)
     return get_activity_history(
         user=user,
         tenant_id=tenant_id,
@@ -3210,7 +3468,7 @@ def get_admin_audit_logs(
 
 @app.get("/api/admin/tenants/{tenant_id}/audit-logs")
 def get_tenant_audit_logs(request: Request, tenant_id: str, limit: int = 100):
-    user = get_optional_user(request)
+    user = get_current_user(request)
     return get_activity_history(user=user, tenant_id=tenant_id, limit=limit)
 
 
@@ -3345,13 +3603,21 @@ def disable_app_catalog(request: Request, app_id: str):
 
 
 @app.post("/api/admin/tenants")
-def create_tenant(request: CreateTenantRequest):
-    return get_or_create_company(request.company_name)
+def create_tenant(payload: CreateTenantRequest, http_request: Request = None):
+    actor = None
+    if http_request is not None:
+        actor = get_current_user(http_request)
+        require_role(actor, {"system_admin"})
+    return get_or_create_company(payload.company_name, actor=actor)
 
 
 @app.get("/api/admin/tenants")
-def get_tenants():
+def get_tenants(http_request: Request = None):
     tenants = load_tenants()
+    if http_request is not None:
+        user = get_current_user(http_request)
+        require_role(user, ADMIN_USER_ROLES)
+        tenants = filter_companies_for_user(tenants, user)
     return sorted(
         tenants,
         key=lambda tenant: tenant.get("created_at", "") if isinstance(tenant, dict) else "",
@@ -3360,19 +3626,26 @@ def get_tenants():
 
 
 @app.get("/api/admin/tenants/{tenant_id}")
-def get_tenant(tenant_id: str):
+def get_tenant(tenant_id: str, http_request: Request = None):
     tenants = load_tenants()
     for tenant in tenants:
         if isinstance(tenant, dict) and tenant.get("tenant_id") == tenant_id:
+            if http_request is not None:
+                assert_company_access(get_current_user(http_request), tenant.get("company_id"))
             return tenant
         if isinstance(tenant, dict) and tenant.get("company_id") == tenant_id:
+            if http_request is not None:
+                assert_company_access(get_current_user(http_request), tenant.get("company_id"))
             return tenant
 
     raise HTTPException(status_code=404, detail="Tenant not found")
 
 
 @app.patch("/api/admin/tenants/{tenant_id}")
-def update_tenant(tenant_id: str, request: UpdateTenantRequest, actor=None):
+def update_tenant(tenant_id: str, request: UpdateTenantRequest, http_request: Request = None, actor=None):
+    if http_request is not None and actor is None:
+        actor = get_current_user(http_request)
+        require_role(actor, {"system_admin"})
     tenants = load_tenants()
     for tenant in tenants:
         if isinstance(tenant, dict) and (
@@ -3403,21 +3676,26 @@ def update_tenant(tenant_id: str, request: UpdateTenantRequest, actor=None):
 
 
 @app.post("/api/admin/companies")
-def create_company(request: CreateTenantRequest, actor=None):
+def create_company(request: CreateTenantRequest, http_request: Request = None, actor=None):
+    if http_request is not None and actor is None:
+        actor = get_current_user(http_request)
+        require_role(actor, {"system_admin"})
     return get_or_create_company(request.company_name, actor=actor)
 
 
 @app.get("/api/admin/companies")
-def get_companies():
-    return get_tenants()
+def get_companies(http_request: Request = None):
+    return get_tenants(http_request)
 
 
 @app.get("/api/admin/companies/{company_id}")
-def get_company(company_id: str):
+def get_company(company_id: str, http_request: Request = None):
     tenants = load_tenants()
     company = find_company_by_id(tenants, company_id)
     if company is None:
         raise HTTPException(status_code=404, detail="Company not found")
+    if http_request is not None:
+        assert_company_access(get_current_user(http_request), company.get("company_id"))
     return company
 
 
@@ -3469,7 +3747,10 @@ def get_agent_jobs(device_id: str):
 
 
 @app.post("/api/agent/jobs")
-def create_job(request: CreateJobRequest, actor=None):
+def create_job(request: CreateJobRequest, http_request: Request = None, actor=None):
+    if http_request is not None and actor is None:
+        actor = get_current_user(http_request)
+        require_role(actor, ADMIN_USER_ROLES)
     if request.action not in ALLOWED_ACTIONS:
         raise HTTPException(status_code=400, detail="Unsupported action")
 
@@ -3495,6 +3776,8 @@ def create_job(request: CreateJobRequest, actor=None):
 
     if not company_id:
         raise HTTPException(status_code=400, detail="Job company could not be resolved")
+    if actor is not None:
+        assert_can_create_job(actor, company_id)
     app_catalog_entry = get_available_catalog_entry(
         request.app,
         request.action,
@@ -3610,15 +3893,28 @@ def post_job_result(job_id: str, result: JobResultRequest):
 
 
 @app.get("/api/agent/jobs/all")
-def get_all_jobs():
-    return load_jobs()
+def get_all_jobs(request: Request):
+    user = get_current_user(request)
+    require_role(user, ADMIN_USER_ROLES)
+    return filter_jobs_for_user(load_jobs(), user)
 
 
 @app.delete("/api/agent/jobs/all")
-def delete_all_jobs():
+def delete_all_jobs(request: Request):
+    user = get_current_user(request)
+    require_role(user, ADMIN_USER_ROLES)
     jobs = load_jobs()
-    removed_count = len(jobs)
-    save_jobs([])
+    if user.get("role") == "system_admin":
+        removed_count = len(jobs)
+        remaining_jobs = []
+    else:
+        remaining_jobs = [
+            job
+            for job in jobs
+            if not isinstance(job, dict) or job.get("company_id") != user.get("company_id")
+        ]
+        removed_count = len(jobs) - len(remaining_jobs)
+    save_jobs(remaining_jobs)
     return {"removed": removed_count}
 
 
@@ -3672,10 +3968,17 @@ def check_in_device(request: DeviceCheckInRequest):
 
 
 @app.get("/api/devices")
-def get_devices(company_id: Optional[str] = None, company_name: Optional[str] = None):
+def get_devices(request: Request, company_id: Optional[str] = None, company_name: Optional[str] = None):
     devices = load_devices()
+    user = get_user_if_credentials_present(request)
     if company_name and not company_id:
         company_id = slugify_company_name(company_name)
+    if user is not None:
+        require_role(user, ADMIN_USER_ROLES)
+        if company_id:
+            assert_company_access(user, company_id)
+        elif user.get("role") != "system_admin":
+            company_id = user.get("company_id")
     if company_id:
         devices = [
             device
@@ -3691,20 +3994,28 @@ def get_devices(company_id: Optional[str] = None, company_name: Optional[str] = 
 
 
 @app.get("/api/devices/{device_id}")
-def get_device(device_id: str):
+def get_device(device_id: str, request: Request = None):
     devices = load_devices()
     for device in devices:
         if isinstance(device, dict) and device.get("device_id") == device_id:
+            user = get_user_if_credentials_present(request) if request is not None else None
+            if user is not None:
+                require_role(user, ADMIN_USER_ROLES)
+                assert_company_access(user, device.get("company_id"))
             return device
 
     raise HTTPException(status_code=404, detail="Device not found")
 
 
 @app.post("/api/admin/devices/{device_id}/approve")
-def approve_device(device_id: str, actor=None):
+def approve_device(device_id: str, http_request: Request = None, actor=None):
+    if http_request is not None and actor is None:
+        actor = get_current_user(http_request)
     devices = load_devices()
     for device in devices:
         if isinstance(device, dict) and device.get("device_id") == device_id:
+            if actor is not None:
+                assert_can_manage_device(actor, device)
             device["approval_status"] = "approved"
             save_devices(devices)
             log_audit(
@@ -3723,10 +4034,14 @@ def approve_device(device_id: str, actor=None):
 
 
 @app.post("/api/admin/devices/{device_id}/reject")
-def reject_device(device_id: str, actor=None):
+def reject_device(device_id: str, http_request: Request = None, actor=None):
+    if http_request is not None and actor is None:
+        actor = get_current_user(http_request)
     devices = load_devices()
     for device in devices:
         if isinstance(device, dict) and device.get("device_id") == device_id:
+            if actor is not None:
+                assert_can_manage_device(actor, device)
             device["approval_status"] = "rejected"
             save_devices(devices)
             log_audit(

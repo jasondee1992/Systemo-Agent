@@ -33,21 +33,31 @@ class User(Base):
 
     user_id: Mapped[str] = mapped_column(String, primary_key=True)
     username: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    email: Mapped[str | None] = mapped_column(String, nullable=True)
     password_hash: Mapped[str] = mapped_column(String, nullable=False)
+    full_name: Mapped[str | None] = mapped_column(String, nullable=True)
     role: Mapped[str] = mapped_column(String, nullable=False)
     company_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    status: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[str] = mapped_column(String, nullable=False)
     updated_at: Mapped[str] = mapped_column(String, nullable=False)
+    last_login_at: Mapped[str | None] = mapped_column(String, nullable=True)
 
     def to_dict(self):
+        email = self.email or self.username
         return {
             "user_id": self.user_id,
             "username": self.username,
+            "email": email,
             "password_hash": self.password_hash,
+            "full_name": self.full_name or self.username,
             "role": self.role,
             "company_id": self.company_id,
+            "tenant_id": self.company_id,
+            "status": self.status or "active",
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "last_login_at": self.last_login_at,
         }
 
 

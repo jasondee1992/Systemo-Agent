@@ -1157,6 +1157,90 @@ python .\agent_cli.py api-list-audit-logs --tenant-id ybalai-builders --limit 20
 
 Expected actions include `tenant_created`, `device_enrolled`, `device_approved`, `job_created`, `job_started`, and either `job_success`, `job_failed`, or `job_skipped`.
 
+## Phase 16 User Login and Role-Based Access
+
+Phase 16 separates dashboard/admin users from Agent/Desktop device identity.
+
+Default mock System Admin:
+
+```text
+email: admin@systemo.local
+password: admin123
+role: system_admin
+```
+
+Mock CLI login stores a local admin token in `config/mock_auth.json`. This token is only for dashboard/admin API commands. The Agent/Desktop still uses `device_id` and device enrollment data, not a dashboard login.
+
+Login and inspect the current user:
+
+```powershell
+python .\mock_server.py
+python .\agent_cli.py api-login admin@systemo.local admin123
+python .\agent_cli.py api-me
+```
+
+Create a tenant and Company Admin:
+
+```powershell
+python .\agent_cli.py api-create-tenant "Ybalai Builders"
+python .\agent_cli.py api-create-user --tenant-id ybalai-builders --email admin@ybalai.local --password admin123 --full-name "Ybalai Admin" --role company_admin
+```
+
+Login as Company Admin:
+
+```powershell
+python .\agent_cli.py api-login admin@ybalai.local admin123
+python .\agent_cli.py api-me
+```
+
+Role rules:
+
+- `system_admin` can view and manage all tenants, users, devices, tickets/jobs, and audit logs.
+- `company_admin` can view and manage only their own tenant devices, tickets/jobs, and audit logs.
+- Agent/Desktop devices cannot log in to the dashboard and cannot approve devices or tickets.
+
+Useful Phase 16 CLI commands:
+
+```powershell
+python .\agent_cli.py api-login admin@systemo.local admin123
+python .\agent_cli.py api-me
+python .\agent_cli.py api-list-users
+python .\agent_cli.py api-create-user --tenant-id ybalai-builders --email admin@ybalai.local --password admin123 --full-name "Ybalai Admin" --role company_admin
+python .\agent_cli.py api-list-tenants
+python .\agent_cli.py api-list-devices
+python .\agent_cli.py api-approve-device <device_id>
+python .\agent_cli.py api-list-audit-logs --limit 20
+```
+
+Dashboard:
+
+```text
+http://127.0.0.1:8008
+```
+
+Login with the email/password above. System Admin sees all companies. Company Admin sees only their own company.
+
+Phase 16 test checklist:
+
+```powershell
+python .\mock_server.py
+python .\agent_cli.py api-login admin@systemo.local admin123
+python .\agent_cli.py api-me
+python .\agent_cli.py api-create-tenant "Ybalai Builders"
+python .\agent_cli.py api-create-user --tenant-id ybalai-builders --email admin@ybalai.local --password admin123 --full-name "Ybalai Admin" --role company_admin
+python .\agent_cli.py api-login admin@ybalai.local admin123
+python .\agent_cli.py api-me
+python .\agent_cli.py api-list-tenants
+python .\agent_cli.py api-list-devices
+```
+
+Then verify:
+
+- Company Admin only sees Ybalai Builders data.
+- Company Admin can approve devices under `ybalai-builders`.
+- Company Admin receives `403 Forbidden` if trying to approve a device from another tenant.
+- Agent/Desktop still checks in and processes approved jobs using device identity, not dashboard login.
+
 To test VLC detection after uninstall:
 
 ```powershell

@@ -29,6 +29,12 @@ def init_database():
 
 def apply_safe_migrations():
     migrations = {
+        "users": {
+            "email": "VARCHAR",
+            "full_name": "VARCHAR",
+            "status": "VARCHAR",
+            "last_login_at": "VARCHAR",
+        },
         "jobs": {
             "app_key": "VARCHAR",
             "display_name": "VARCHAR",
