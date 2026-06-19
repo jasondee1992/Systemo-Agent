@@ -15,7 +15,9 @@ from agent import (
     DEFAULT_JOB_SOURCE,
     detect_app_installation,
     load_or_create_agent_config,
+    report_inventory_to_api,
     save_json,
+    scan_installed_apps,
 )
 
 
@@ -58,6 +60,15 @@ COMPANY_DISPLAY_FIELDS = [
     "company_name",
     "created_at",
     "updated_at",
+]
+INVENTORY_DISPLAY_FIELDS = [
+    "display_name",
+    "detected_name",
+    "detected_id",
+    "version",
+    "source",
+    "is_catalog_match",
+    "last_seen_at",
 ]
 TENANT_DISPLAY_FIELDS = [
     "tenant_id",
@@ -662,6 +673,75 @@ def detect_app(app):
     print(f"output_preview: {result.get('output_preview') or '-'}")
 
 
+def print_inventory_app(app):
+    if not isinstance(app, dict):
+        print("- Invalid inventory entry")
+        return
+
+    label = app.get("display_name") or app.get("detected_name") or app.get("name") or "-"
+    print(f"- {label}")
+    for field in INVENTORY_DISPLAY_FIELDS[1:]:
+        print(f"  {field}: {get_job_value(app, field)}")
+
+
+def print_inventory_apps(apps, limit=None):
+    if not apps:
+        print("No inventory records found.")
+        return
+
+    visible_apps = apps[:limit] if limit else apps
+    for app in visible_apps:
+        print_inventory_app(app)
+    if limit and len(apps) > limit:
+        print(f"... {len(apps) - limit} more app(s)")
+
+
+def scan_inventory():
+    config = load_or_create_agent_config()
+    apps = scan_installed_apps()
+    print(f"local_apps_found: {len(apps)}")
+
+    if (config.get("job_source") or DEFAULT_JOB_SOURCE) == "api":
+        result = report_inventory_to_api(config, apps, status="success")
+        print(f"api_scan_id: {result.get('scan_id')}")
+        print(f"api_status: {result.get('status')}")
+        print(f"api_apps_found: {result.get('apps_found_count')}")
+        print(f"api_catalog_matches: {result.get('catalog_matches_count')}")
+    else:
+        print_inventory_apps(apps, limit=25)
+
+
+def api_device_inventory(device_id):
+    config = load_or_create_agent_config()
+    requests = get_requests_module()
+    response = requests.get(
+        f"{get_api_base_url(config)}/api/devices/{device_id}/inventory",
+        timeout=10,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    device = payload.get("device") if isinstance(payload, dict) else {}
+    latest_scan = payload.get("latest_scan") if isinstance(payload, dict) else None
+    apps = payload.get("apps") if isinstance(payload, dict) else []
+    print(f"device_id: {device.get('device_id') or device_id}")
+    print(f"company_name: {device.get('company_name') or '-'}")
+    print(f"latest_scan_status: {(latest_scan or {}).get('status') or '-'}")
+    print(f"latest_scan_finished_at: {(latest_scan or {}).get('finished_at') or '-'}")
+    print(f"apps_found: {len(apps) if isinstance(apps, list) else 0}")
+    print_inventory_apps(apps if isinstance(apps, list) else [])
+
+
+def print_inventory():
+    config = load_or_create_agent_config()
+    if (config.get("job_source") or DEFAULT_JOB_SOURCE) == "api" and config.get("device_id"):
+        api_device_inventory(config.get("device_id"))
+        return
+
+    apps = scan_installed_apps()
+    print(f"local_apps_found: {len(apps)}")
+    print_inventory_apps(apps, limit=25)
+
+
 def get_job_value(job, field):
     value = job.get(field)
     if value is None or value == "":
@@ -933,6 +1013,12 @@ def build_parser():
     detect_parser = subparsers.add_parser("detect", help="Run approved app detection")
     detect_parser.add_argument("app")
 
+    subparsers.add_parser("scan-inventory", help="Scan installed apps and report to API in API mode")
+    subparsers.add_parser("inventory", help="Show local or API inventory summary")
+
+    api_device_inventory_parser = subparsers.add_parser("api-device-inventory", help="Show API inventory for one device")
+    api_device_inventory_parser.add_argument("device_id")
+
     subparsers.add_parser("status", help="Print current jobs")
     subparsers.add_parser("logs", help="Print the last 50 agent log lines")
     subparsers.add_parser("info", help="Print local agent identity and config")
@@ -995,6 +1081,12 @@ def main():
             api_update_tenant(args.tenant_id, args.company_name, args.status)
         elif args.command == "detect":
             detect_app(args.app)
+        elif args.command == "scan-inventory":
+            scan_inventory()
+        elif args.command == "inventory":
+            print_inventory()
+        elif args.command == "api-device-inventory":
+            api_device_inventory(args.device_id)
         elif args.command == "status":
             print_status()
         elif args.command == "logs":

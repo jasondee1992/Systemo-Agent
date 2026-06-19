@@ -9,10 +9,20 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from database import init_database, session_scope
-from models import AppCatalog, AppRequest, AuditLog, Company, Device, Job, User
+from models import (
+    AppCatalog,
+    AppRequest,
+    AuditLog,
+    Company,
+    Device,
+    DeviceInstalledApp,
+    InventoryScanRun,
+    Job,
+    User,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -98,7 +108,7 @@ class CreateAppCatalogRequest(BaseModel):
     display_name: str
     winget_id: str
     description: Optional[str] = None
-    supported_actions: list[str] = ["install", "uninstall"]
+    supported_actions: list[str] = Field(default_factory=lambda: ["install", "uninstall"])
     install_command_template: Optional[str] = None
     uninstall_command_template: Optional[str] = None
     detection_method: str = "winget"
@@ -124,6 +134,28 @@ class UpdateAppCatalogRequest(BaseModel):
     enabled: Optional[bool] = None
     scope: Optional[str] = None
     company_id: Optional[str] = None
+
+
+class InventoryAppRequest(BaseModel):
+    name: Optional[str] = None
+    display_name: Optional[str] = None
+    detected_name: Optional[str] = None
+    id: Optional[str] = None
+    detected_id: Optional[str] = None
+    version: Optional[str] = None
+    source: Optional[str] = None
+    install_location: Optional[str] = None
+    detection_method: str = "winget"
+
+
+class InventoryReportRequest(BaseModel):
+    device_id: str
+    company_id: Optional[str] = None
+    company_name: Optional[str] = None
+    scan_id: Optional[str] = None
+    status: str = "success"
+    error_message: Optional[str] = None
+    apps: list[InventoryAppRequest] = Field(default_factory=list)
 
 
 AUDIT_JOB_RESULT_EVENTS = {
@@ -510,6 +542,206 @@ def set_app_catalog_enabled(app_id, enabled, user):
             )
             return entry
     raise HTTPException(status_code=404, detail="App catalog entry not found")
+
+
+def normalize_inventory_identifier(value):
+    return (value or "").strip().lower()
+
+
+def match_inventory_app_to_catalog(installed_app, catalog_entries):
+    detected_id = normalize_inventory_identifier(installed_app.get("detected_id") or installed_app.get("id"))
+    detected_name = normalize_inventory_identifier(installed_app.get("detected_name") or installed_app.get("name"))
+
+    for entry in catalog_entries:
+        candidate_ids = {
+            normalize_inventory_identifier(entry.get("detection_id")),
+            normalize_inventory_identifier(entry.get("winget_id")),
+            normalize_inventory_identifier(entry.get("app_key")),
+        }
+        if detected_id and detected_id in candidate_ids:
+            return entry
+
+    for entry in catalog_entries:
+        app_key = normalize_inventory_identifier(entry.get("app_key"))
+        display_name = normalize_inventory_identifier(entry.get("display_name"))
+        if detected_name and (detected_name == app_key or detected_name == display_name):
+            return entry
+
+    return None
+
+
+def get_inventory_rows(company_id=None, device_id=None):
+    with session_scope() as session:
+        query = session.query(DeviceInstalledApp)
+        if company_id:
+            query = query.filter(DeviceInstalledApp.company_id == company_id)
+        if device_id:
+            query = query.filter(DeviceInstalledApp.device_id == device_id)
+        return [row.to_dict() for row in query.order_by(DeviceInstalledApp.display_name.asc()).all()]
+
+
+def get_inventory_scan_rows(company_id=None, device_id=None):
+    with session_scope() as session:
+        query = session.query(InventoryScanRun)
+        if company_id:
+            query = query.filter(InventoryScanRun.company_id == company_id)
+        if device_id:
+            query = query.filter(InventoryScanRun.device_id == device_id)
+        return [row.to_dict() for row in query.order_by(InventoryScanRun.started_at.desc()).all()]
+
+
+def get_latest_inventory_scan(device_id):
+    scans = get_inventory_scan_rows(device_id=device_id)
+    return scans[0] if scans else None
+
+
+def enrich_devices_with_inventory(devices):
+    with session_scope() as session:
+        for device in devices:
+            if not isinstance(device, dict):
+                continue
+            device_id = device.get("device_id")
+            if not device_id:
+                continue
+            device["installed_apps_count"] = session.query(DeviceInstalledApp).filter(
+                DeviceInstalledApp.device_id == device_id
+            ).count()
+            latest_scan = session.query(InventoryScanRun).filter(
+                InventoryScanRun.device_id == device_id
+            ).order_by(InventoryScanRun.started_at.desc()).first()
+            device["last_inventory_scan_at"] = latest_scan.finished_at if latest_scan else None
+            device["last_inventory_status"] = latest_scan.status if latest_scan else None
+    return devices
+
+
+def submit_device_inventory(payload):
+    device = get_device(payload.device_id)
+    if payload.company_id and payload.company_id != device.get("company_id"):
+        raise HTTPException(status_code=403, detail="Device company does not match inventory payload")
+    if payload.company_name and slugify_company_name(payload.company_name) != device.get("company_id"):
+        raise HTTPException(status_code=403, detail="Device company does not match inventory payload")
+
+    company_id = device.get("company_id")
+    company_name = device.get("company_name")
+    scan_id = payload.scan_id or f"scan-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    started_at = utc_now()
+    log_audit(
+        "INVENTORY_SCAN_STARTED",
+        f"Inventory scan started for device {payload.device_id}",
+        company_id=company_id,
+        company_name=company_name,
+        device_id=payload.device_id,
+        target_type="device",
+        target_label=device.get("hostname") or payload.device_id,
+        metadata={"scan_id": scan_id},
+    )
+
+    catalog_entries = load_app_catalog_entries()
+    now = utc_now()
+    installed_rows = []
+    catalog_matches_count = 0
+    for app in payload.apps:
+        app_data = app.dict()
+        detected_name = app_data.get("detected_name") or app_data.get("name") or app_data.get("display_name") or "-"
+        detected_id = app_data.get("detected_id") or app_data.get("id")
+        match = match_inventory_app_to_catalog(
+            {"detected_id": detected_id, "detected_name": detected_name},
+            catalog_entries,
+        )
+        if match:
+            catalog_matches_count += 1
+        installed_rows.append(
+            {
+                "company_id": company_id,
+                "device_id": payload.device_id,
+                "app_key": match.get("app_key") if match else None,
+                "catalog_app_id": match.get("app_id") if match else None,
+                "display_name": match.get("display_name") if match else detected_name,
+                "detected_name": detected_name,
+                "detected_id": detected_id,
+                "version": app_data.get("version"),
+                "source": app_data.get("source"),
+                "install_location": app_data.get("install_location"),
+                "detection_method": app_data.get("detection_method") or "winget",
+                "is_catalog_match": bool(match),
+                "last_seen_at": now,
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+
+    status = payload.status if payload.status in {"started", "success", "failed"} else "success"
+    error_message = payload.error_message
+    with session_scope() as session:
+        if status != "failed":
+            session.query(DeviceInstalledApp).filter(
+                DeviceInstalledApp.device_id == payload.device_id
+            ).delete()
+            for row_data in installed_rows:
+                session.add(DeviceInstalledApp(**row_data))
+
+        existing_scan = session.get(InventoryScanRun, scan_id)
+        if existing_scan is None:
+            existing_scan = InventoryScanRun(
+                scan_id=scan_id,
+                company_id=company_id,
+                device_id=payload.device_id,
+                status=status,
+                started_at=started_at,
+            )
+            session.add(existing_scan)
+        existing_scan.status = status
+        existing_scan.apps_found_count = len(installed_rows)
+        existing_scan.catalog_matches_count = catalog_matches_count
+        existing_scan.finished_at = now
+        existing_scan.error_message = error_message
+
+        device_row = session.get(Device, payload.device_id)
+        if device_row is not None:
+            device_row.last_seen_at = now
+            device_row.updated_at = now
+
+    if status == "failed":
+        log_audit(
+            "INVENTORY_SCAN_FAILED",
+            f"Inventory scan failed for device {payload.device_id}",
+            company_id=company_id,
+            company_name=company_name,
+            device_id=payload.device_id,
+            target_type="device",
+            target_label=device.get("hostname") or payload.device_id,
+            metadata={"scan_id": scan_id, "error_message": error_message},
+        )
+    else:
+        log_audit(
+            "INVENTORY_SCAN_SUCCESS",
+            f"Inventory scan found {len(installed_rows)} app(s)",
+            company_id=company_id,
+            company_name=company_name,
+            device_id=payload.device_id,
+            target_type="device",
+            target_label=device.get("hostname") or payload.device_id,
+            metadata={"scan_id": scan_id, "catalog_matches_count": catalog_matches_count},
+        )
+        log_audit(
+            "INVENTORY_UPDATED",
+            f"Inventory updated for device {payload.device_id}",
+            company_id=company_id,
+            company_name=company_name,
+            device_id=payload.device_id,
+            target_type="device",
+            target_label=device.get("hostname") or payload.device_id,
+            metadata={"scan_id": scan_id, "apps_found_count": len(installed_rows)},
+        )
+
+    return {
+        "scan_id": scan_id,
+        "status": status,
+        "apps_found_count": len(installed_rows),
+        "catalog_matches_count": catalog_matches_count,
+        "device_id": payload.device_id,
+        "company_id": company_id,
+    }
 
 
 def get_default_company_for_legacy_data():
@@ -1932,6 +2164,7 @@ def get_dashboard_html():
         </label>
         <button type="submit">Create Request</button>
       </form>
+      <div id="inventoryHint" class="message"></div>
       <div id="formMessage" class="message"></div>
     </section>
 
@@ -1940,6 +2173,13 @@ def get_dashboard_html():
         <h2>Devices</h2>
       </div>
       <div id="devicesTable" class="table-wrap"></div>
+    </section>
+
+    <section>
+      <div class="section-header">
+        <h2>Device Inventory</h2>
+      </div>
+      <div id="inventoryTable" class="table-wrap"></div>
     </section>
 
     <section>
@@ -1978,7 +2218,8 @@ def get_dashboard_html():
   <script>
     const companyFields = ["company_id", "company_name", "created_at", "updated_at"];
     const catalogFields = ["app_id", "display_name", "app_key", "winget_id", "supported_actions", "enabled", "scope", "company_id", "updated_at"];
-    const deviceFields = ["company_name", "hostname", "username", "os", "agent_version", "connection_status", "approval_status", "last_seen_at"];
+    const deviceFields = ["company_name", "hostname", "username", "os", "agent_version", "connection_status", "approval_status", "installed_apps_count", "last_inventory_scan_at", "last_seen_at"];
+    const inventoryFields = ["device_id", "display_name", "detected_name", "detected_id", "version", "source", "is_catalog_match", "last_seen_at"];
     const requestFields = ["request_id", "company_name", "target_device_id", "app", "action", "requested_by_username", "status", "linked_job_id", "created_at"];
     const jobFields = ["id", "company_name", "device_id", "app", "action", "status", "attempts", "message", "started_at", "finished_at"];
     const auditFields = ["created_at", "event_type", "company_name", "actor_username", "actor_role", "target_label", "message"];
@@ -1999,6 +2240,10 @@ def get_dashboard_html():
       "JOB_SUCCESS",
       "JOB_FAILED",
       "JOB_SKIPPED",
+      "INVENTORY_SCAN_STARTED",
+      "INVENTORY_SCAN_SUCCESS",
+      "INVENTORY_SCAN_FAILED",
+      "INVENTORY_UPDATED",
       "UNAUTHORIZED_ACCESS_ATTEMPT",
     ];
     let currentUser = null;
@@ -2006,6 +2251,7 @@ def get_dashboard_html():
     let lastDevices = [];
     let lastCatalog = { apps: [], actions: ["install", "uninstall"], entries: [] };
     let lastAppCatalog = [];
+    let lastInventory = [];
 
     function escapeHtml(value) {
       return String(value ?? "-")
@@ -2123,6 +2369,24 @@ def get_dashboard_html():
       target.innerHTML = `<table><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>`;
     }
 
+    function renderInventory(rows) {
+      const target = document.getElementById("inventoryTable");
+      if (!rows.length) {
+        target.innerHTML = '<div class="empty">No inventory records found.</div>';
+        return;
+      }
+
+      const header = inventoryFields.map((field) => `<th>${escapeHtml(field)}</th>`).join("");
+      const body = rows.map((row) => {
+        const cells = inventoryFields.map((field) => {
+          const value = field === "is_catalog_match" ? (row[field] ? "yes" : "no") : row[field];
+          return `<td>${field === "is_catalog_match" ? statusCell(value) : escapeHtml(value)}</td>`;
+        }).join("");
+        return `<tr>${cells}</tr>`;
+      }).join("");
+      target.innerHTML = `<table><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>`;
+    }
+
     function populateSelect(selectId, values) {
       const select = document.getElementById(selectId);
       const currentValue = select.value;
@@ -2163,6 +2427,32 @@ def get_dashboard_html():
       const selectedApp = document.getElementById("appSelect").value;
       const selectedEntry = catalogEntries.find((entry) => entry.app_key === selectedApp);
       populateSelect("actionSelect", selectedEntry ? selectedEntry.supported_actions : lastCatalog.actions);
+      updateInventoryHint();
+    }
+
+    function updateInventoryHint() {
+      const hint = document.getElementById("inventoryHint");
+      const deviceId = document.getElementById("deviceSelect").value;
+      const appKey = document.getElementById("appSelect").value;
+      const action = document.getElementById("actionSelect").value;
+      hint.className = "message";
+      hint.textContent = "";
+      if (!deviceId || deviceId === "any" || !appKey) {
+        return;
+      }
+
+      const deviceInventory = lastInventory.filter((item) => item.device_id === deviceId);
+      if (!deviceInventory.length) {
+        hint.textContent = "Inventory warning: no inventory scan is available for this device yet.";
+        return;
+      }
+      const installed = deviceInventory.some((item) => item.app_key === appKey);
+      if (action === "install" && installed) {
+        hint.textContent = "Inventory warning: this app appears to already be installed on the selected device.";
+      }
+      if (action === "uninstall" && !installed) {
+        hint.textContent = "Inventory warning: this app does not appear in the selected device inventory.";
+      }
     }
 
     function refreshAuditFilters() {
@@ -2203,11 +2493,12 @@ def get_dashboard_html():
 
     async function refreshAll() {
       try {
-        const [session, health, companies, devices, requests, jobs, auditLogs, catalog, appCatalog] = await Promise.all([
+        const [session, health, companies, devices, inventory, requests, jobs, auditLogs, catalog, appCatalog] = await Promise.all([
           fetchJson("/dashboard/api/session"),
           fetchJson("/health"),
           fetchJson("/dashboard/api/companies"),
           fetchJson("/dashboard/api/devices"),
+          fetchJson("/api/inventory"),
           fetchJson("/api/app-requests"),
           fetchJson("/dashboard/api/jobs"),
           fetchJson(getAuditPath()),
@@ -2220,6 +2511,7 @@ def get_dashboard_html():
         setHealth(health.status === "ok", `Backend ${health.status}`);
         lastCompanies = Array.isArray(companies) ? companies : [];
         lastDevices = Array.isArray(devices) ? devices : [];
+        lastInventory = Array.isArray(inventory) ? inventory : [];
         lastCatalog = catalog;
         lastAppCatalog = Array.isArray(appCatalog) ? appCatalog : [];
         refreshFormOptions();
@@ -2227,6 +2519,7 @@ def get_dashboard_html():
         renderTable("companiesTable", companyFields, lastCompanies);
         renderCatalog(lastAppCatalog);
         renderDevices(lastDevices);
+        renderInventory(lastInventory);
         renderRequests(Array.isArray(requests) ? [...requests].reverse() : []);
         renderTable("jobsTable", jobFields, Array.isArray(jobs) ? [...jobs].reverse() : []);
         renderTable("auditTable", auditFields, Array.isArray(auditLogs) ? auditLogs : []);
@@ -2399,6 +2692,8 @@ def get_dashboard_html():
     });
     document.getElementById("companySelect").addEventListener("change", refreshFormOptions);
     document.getElementById("appSelect").addEventListener("change", refreshFormOptions);
+    document.getElementById("deviceSelect").addEventListener("change", updateInventoryHint);
+    document.getElementById("actionSelect").addEventListener("change", updateInventoryHint);
     document.getElementById("companyForm").addEventListener("submit", createCompany);
     document.getElementById("catalogForm").addEventListener("submit", createCatalogEntry);
     document.getElementById("requestForm").addEventListener("submit", createAppRequest);
@@ -2637,6 +2932,68 @@ def get_audit_logs(
     )
     safe_limit = max(1, min(int(limit or 100), 500))
     return sorted_logs[:safe_limit]
+
+
+@app.post("/api/agent/inventory")
+def post_agent_inventory(payload: InventoryReportRequest):
+    return submit_device_inventory(payload)
+
+
+@app.get("/api/devices/{device_id}/inventory")
+def get_device_inventory(request: Request, device_id: str):
+    device = get_device(device_id)
+    user = get_optional_user(request)
+    if user is not None:
+        assert_company_access(user, device.get("company_id"))
+    return {
+        "device": device,
+        "apps": get_inventory_rows(device_id=device_id),
+        "latest_scan": get_latest_inventory_scan(device_id),
+    }
+
+
+@app.get("/api/inventory")
+def get_inventory(request: Request, company_id: Optional[str] = None):
+    user = get_optional_user(request)
+    if user is None:
+        target_company_id = company_id
+    elif company_id:
+        assert_company_access(user, company_id)
+        target_company_id = company_id
+    elif user.get("role") == "system_admin":
+        target_company_id = None
+    else:
+        target_company_id = user.get("company_id")
+    return get_inventory_rows(company_id=target_company_id)
+
+
+@app.get("/api/devices/{device_id}/catalog-status")
+def get_device_catalog_status(request: Request, device_id: str):
+    device = get_device(device_id)
+    user = get_optional_user(request)
+    if user is not None:
+        assert_company_access(user, device.get("company_id"))
+    installed_apps = get_inventory_rows(device_id=device_id)
+    installed_keys = {app.get("app_key") for app in installed_apps if app.get("app_key")}
+    installed_ids = {
+        normalize_inventory_identifier(app.get("detected_id"))
+        for app in installed_apps
+        if app.get("detected_id")
+    }
+    catalog_entries = load_app_catalog_entries()
+    if user is not None:
+        catalog_entries = filter_catalog_for_user(catalog_entries, user, enabled_only=True)
+    else:
+        catalog_entries = [entry for entry in catalog_entries if entry.get("enabled")]
+    statuses = []
+    for entry in catalog_entries:
+        installed = (
+            entry.get("app_key") in installed_keys
+            or normalize_inventory_identifier(entry.get("detection_id")) in installed_ids
+            or normalize_inventory_identifier(entry.get("winget_id")) in installed_ids
+        )
+        statuses.append({**entry, "installed": installed})
+    return statuses
 
 
 @app.get("/health")
@@ -3035,11 +3392,12 @@ def get_devices(company_id: Optional[str] = None, company_name: Optional[str] = 
             for device in devices
             if isinstance(device, dict) and device.get("company_id") == company_id
         ]
-    return sorted(
+    sorted_devices = sorted(
         devices,
         key=lambda device: device.get("last_seen_at", "") if isinstance(device, dict) else "",
         reverse=True,
     )
+    return enrich_devices_with_inventory(sorted_devices)
 
 
 @app.get("/api/devices/{device_id}")

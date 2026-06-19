@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import platform
+import re
 import socket
 import subprocess
 import time
@@ -301,6 +302,106 @@ def sanitize_output_preview(output, max_length=500):
     if len(preview) > max_length:
         return f"{preview[:max_length]}..."
     return preview
+
+
+def split_winget_columns(line):
+    return [part.strip() for part in re.split(r"\s{2,}", line.strip()) if part.strip()]
+
+
+def parse_winget_list_output(output):
+    apps = []
+    data_started = False
+    for line in (output or "").splitlines():
+        stripped = line.rstrip()
+        if not stripped:
+            continue
+        if set(stripped.strip()) <= {"-"} and len(stripped.strip()) >= 3:
+            data_started = True
+            continue
+        if not data_started:
+            continue
+
+        parts = split_winget_columns(stripped)
+        if len(parts) < 3:
+            continue
+        source = parts[-1] if len(parts) >= 4 else None
+        if source and source.lower() not in {"winget", "msstore"}:
+            source = None
+        apps.append(
+            {
+                "name": parts[0],
+                "detected_name": parts[0],
+                "id": parts[1],
+                "detected_id": parts[1],
+                "version": parts[2],
+                "source": source,
+                "detection_method": "winget",
+            }
+        )
+    return apps
+
+
+def scan_installed_apps():
+    setup_logging()
+    command = ["winget", "list", "--accept-source-agreements"]
+    LOGGER.info("Inventory scan command: %s", " ".join(command))
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        shell=False,
+        check=False,
+        timeout=180,
+    )
+    combined_output = "\n".join(part.strip() for part in [completed.stdout, completed.stderr] if part.strip())
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"winget list failed with exit code {completed.returncode}: {sanitize_output_preview(combined_output)}"
+        )
+    apps = parse_winget_list_output(completed.stdout)
+    LOGGER.info("Inventory scan found %s app(s)", len(apps))
+    return apps
+
+
+def report_inventory_to_api(config, apps, status="success", error_message=None, scan_id=None):
+    requests = get_requests_module()
+    api_base_url = get_api_base_url(config)
+    payload = {
+        "device_id": config.get("device_id"),
+        "company_id": config.get("company_id"),
+        "company_name": config.get("company_name"),
+        "scan_id": scan_id,
+        "status": status,
+        "error_message": error_message,
+        "apps": apps,
+    }
+    response = requests.post(
+        f"{api_base_url}/api/agent/inventory",
+        json=payload,
+        timeout=30,
+    )
+    response.raise_for_status()
+    result = response.json()
+    LOGGER.info(
+        "Inventory reported: scan_id=%s apps_found=%s catalog_matches=%s",
+        result.get("scan_id"),
+        result.get("apps_found_count"),
+        result.get("catalog_matches_count"),
+    )
+    return result
+
+
+def scan_and_report_inventory(config):
+    try:
+        apps = scan_installed_apps()
+        return report_inventory_to_api(config, apps, status="success")
+    except Exception as error:
+        LOGGER.exception("Inventory scan/report failed")
+        try:
+            return report_inventory_to_api(config, [], status="failed", error_message=str(error))
+        except Exception:
+            LOGGER.exception("Inventory failure report failed")
+        return None
 
 
 def detect_app_installation(app_key, catalog_override=None):
@@ -680,6 +781,8 @@ def process_api_jobs(config):
         if processed_job is not None:
             try:
                 report_api_job_result(config, processed_job)
+                if processed_job.get("status") == "success":
+                    scan_and_report_inventory(config)
             except Exception:
                 LOGGER.exception(
                     "API error: failed to report result for job %s",
@@ -709,6 +812,7 @@ def run_agent_loop(stop_event=None):
     )
     write_log("Systemo Agent started")
     write_log("Heartbeat enabled")
+    startup_inventory_reported = False
 
     while stop_event is None or not stop_event.is_set():
         config = load_agent_config()
@@ -726,6 +830,9 @@ def run_agent_loop(stop_event=None):
             LOGGER.info("Current job_source: %s", job_source)
             if job_source == "api":
                 try_api_check_in(config)
+                if not startup_inventory_reported:
+                    scan_and_report_inventory(config)
+                    startup_inventory_reported = True
                 process_api_jobs(config)
             else:
                 process_pending_jobs()

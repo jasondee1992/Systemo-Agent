@@ -987,6 +987,102 @@ Catalog changes are audited with:
 - `APP_CATALOG_DISABLED`
 - `APP_CATALOG_VALIDATION_FAILED`
 
+## Phase 14 Device Inventory
+
+The agent can scan installed applications with `winget list` and report inventory to the API. Inventory is stored in SQLite and shown in the dashboard.
+
+Inventory is scanned:
+
+- once when the agent starts in API mode
+- after a successful API install or uninstall job
+- manually with the CLI
+
+Manual inventory scan:
+
+```powershell
+python .\agent_cli.py scan-inventory
+```
+
+Show inventory for the local agent:
+
+```powershell
+python .\agent_cli.py inventory
+```
+
+Show API inventory for a specific device:
+
+```powershell
+python .\agent_cli.py api-device-inventory <device_id>
+```
+
+Inventory API endpoints:
+
+```text
+POST /api/agent/inventory
+GET /api/devices/{device_id}/inventory
+GET /api/inventory?company_id=<company_id>
+GET /api/devices/{device_id}/catalog-status
+```
+
+Inventory audit events:
+
+- `INVENTORY_SCAN_STARTED`
+- `INVENTORY_SCAN_SUCCESS`
+- `INVENTORY_SCAN_FAILED`
+- `INVENTORY_UPDATED`
+
+Manual scan test:
+
+```powershell
+python .\mock_server.py
+python .\agent_cli.py install-agent --company "Ybalai Builders" --api-url "http://127.0.0.1:8008"
+python .\agent_cli.py api-list-devices
+python .\agent_cli.py api-approve-device <device_id>
+python .\agent_cli.py scan-inventory
+python .\agent_cli.py inventory
+```
+
+Open the dashboard and verify the Devices table shows installed app count and last inventory scan time:
+
+```text
+http://127.0.0.1:8008
+```
+
+Install/uninstall refresh test:
+
+```powershell
+python .\agent_cli.py api-clear-jobs --yes
+python .\agent_cli.py api-add-job 7zip install
+Start-Sleep -Seconds 45
+python .\agent_cli.py api-list-jobs
+python .\agent_cli.py api-device-inventory <device_id>
+python .\agent_cli.py api-add-job 7zip uninstall
+Start-Sleep -Seconds 45
+python .\agent_cli.py api-list-jobs
+python .\agent_cli.py api-device-inventory <device_id>
+```
+
+Catalog matching test:
+
+- Installed `7zip` should appear as a catalog match.
+- Other installed apps still appear as non-catalog inventory records.
+
+Role access test:
+
+1. Login as `admin / admin123` and verify all device inventory is visible.
+2. Login as `ybalai_admin / admin123` and verify only Ybalai Builders inventory is visible.
+3. Login as `ybalai_viewer / admin123` and verify inventory is read-only.
+
+Persistence test:
+
+```powershell
+# Stop mock_server.py, then start it again.
+python .\mock_server.py
+python .\agent_cli.py api-device-inventory <device_id>
+```
+
+The previously submitted inventory should still be present.
+
 To test VLC detection after uninstall:
 
 ```powershell

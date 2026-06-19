@@ -250,6 +250,74 @@ class AppCatalog(Base):
         }
 
 
+class DeviceInstalledApp(Base):
+    __tablename__ = "device_installed_apps"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    company_id: Mapped[str] = mapped_column(String, nullable=False)
+    device_id: Mapped[str] = mapped_column(String, nullable=False)
+    app_key: Mapped[str | None] = mapped_column(String, nullable=True)
+    catalog_app_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    display_name: Mapped[str] = mapped_column(String, nullable=False)
+    detected_name: Mapped[str] = mapped_column(String, nullable=False)
+    detected_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    version: Mapped[str | None] = mapped_column(String, nullable=True)
+    source: Mapped[str | None] = mapped_column(String, nullable=True)
+    install_location: Mapped[str | None] = mapped_column(String, nullable=True)
+    detection_method: Mapped[str] = mapped_column(String, nullable=False, default="winget")
+    is_catalog_match: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_seen_at: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[str] = mapped_column(String, nullable=False)
+    updated_at: Mapped[str] = mapped_column(String, nullable=False)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "company_id": self.company_id,
+            "device_id": self.device_id,
+            "app_key": self.app_key,
+            "catalog_app_id": self.catalog_app_id,
+            "display_name": self.display_name,
+            "detected_name": self.detected_name,
+            "detected_id": self.detected_id,
+            "version": self.version,
+            "source": self.source,
+            "install_location": self.install_location,
+            "detection_method": self.detection_method,
+            "is_catalog_match": self.is_catalog_match,
+            "last_seen_at": self.last_seen_at,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+
+class InventoryScanRun(Base):
+    __tablename__ = "inventory_scan_runs"
+
+    scan_id: Mapped[str] = mapped_column(String, primary_key=True)
+    company_id: Mapped[str] = mapped_column(String, nullable=False)
+    device_id: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    apps_found_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    catalog_matches_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    started_at: Mapped[str] = mapped_column(String, nullable=False)
+    finished_at: Mapped[str | None] = mapped_column(String, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    def to_dict(self):
+        return {
+            "scan_id": self.scan_id,
+            "company_id": self.company_id,
+            "device_id": self.device_id,
+            "status": self.status,
+            "apps_found_count": self.apps_found_count,
+            "catalog_matches_count": self.catalog_matches_count,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "error_message": self.error_message,
+        }
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 
